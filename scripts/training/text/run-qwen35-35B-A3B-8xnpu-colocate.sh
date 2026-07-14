@@ -2,10 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-9B 8xGPU fully async training script.
+# Qwen3.5-35B-A3B 8xNPU colocate training script.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen35-9B-8xnpu-async.sh
+#   bash scripts/training/text/run-qwen35-35B-A3B-8xnpu-colocate.sh
 
 set -ex
 set -o pipefail
@@ -16,33 +16,38 @@ export ASCEND_COREDUMP_SIGNAL=none
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63050
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64050
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TMS_HOOK_MODE="preload"
+export HYDRA_FULL_ERROR=1
 
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+echo "SCRIPT_DIR: $SCRIPT_DIR"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
+source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 # Support setting env from outside
-EXP_DIR="${EXP_DIR:-/root/exps}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+
+
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B/
-   --ref-load ${MODEL_DIR}/Qwen3.5-9B/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B/
+   --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B/
    --megatron-to-hf-mode bridge
-   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
-   --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
-   --save-interval 50
+   --load ${EXP_DIR}/Qwen3.5-35B-A3B-mcore_8xnpu/
+   --save ${EXP_DIR}/Qwen3.5-35B-A3B-mcore_8xnpu/
+   --save-interval 100
    --max-actor-ckpt-to-keep 1
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
@@ -52,22 +57,22 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 128
+   --balance-data
    --use-fault-tolerance
 )
 
 EVAL_ARGS=(
-   --log-passrate
    --skip-eval-before-train
+   --log-passrate
    --eval-interval 20
-   --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192
-   --eval-top-p 0.7
 )
 
 PERF_ARGS=(
@@ -75,8 +80,9 @@ PERF_ARGS=(
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
+
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -85,13 +91,18 @@ PERF_ARGS=(
    --qkv-format bshd
    --micro-batch-size 1
    --max-tokens-per-gpu 10240
+
+   # use deepep for megatron
+   # --moe-flex-dispatcher-backend deepep
+   # --moe-token-dispatcher-type flex
+   # --moe-router-dtype fp32
    --no-rope-fusion
    --no-gradient-accumulation-fusion
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   # --use-kl-loss
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -107,15 +118,21 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
+
+   # NOTE(wuhuan): to avoid algorithm performance degradation
+   --moe-router-load-balancing-type "none"
+   --moe-aux-loss-coeff 0.0
 )
 
+
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --rollout-num-gpus-per-engine 8
+   --sglang-mem-fraction-static 0.7
+   --sglang-cuda-graph-bs $(seq 16 16 256)
    --sglang-device npu
    --sglang-disable-radix-cache
    --sglang-chunked-prefill-size 8192
@@ -123,17 +140,19 @@ SGLANG_ARGS=(
    --sglang-enable-dp-attention
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
-   --sglang-max-running-requests 256
 )
 
+
 WANDB_ARGS=(
-   --use-tensorboard
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9B-GRPO-4x-sync-${now}
+   --tb-experiment-name qwen3-30B-A3B-r3${now}
+   # --use-wandb
+   # --wandb-project slime-dev
+   # --wandb-group qwen3-4B-test
+   # --wandb-key ${WANDB_KEY}
 )
-
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -145,20 +164,26 @@ MISC_ARGS=(
    # need to comment this when using model with MLA
    --attention-backend flash
    --use-flash-attn
+   # NOTE(wuhuan): to avoid algorithm performance degradation
+   --no-rope-fusion
+   --moe-router-load-balancing-type "none"
+   --moe-aux-loss-coeff 0.0
+   # NOTE(wuli_ugliest): NPU do not support gradient-accumulation-fusion with GND-triton now.
+   --no-gradient-accumulation-fusion
 )
+
 
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'\
-   --max-staleness 2 \
+   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --max-staleness 0 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 32 \
-   --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
-   --fully-async \
+   --colocate \
     --use-health-check \
+    "${ROUTING_REPLAY_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
@@ -168,4 +193,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-npu8-async-${now}.log
+    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-GRPO-gpu8-${now}.log

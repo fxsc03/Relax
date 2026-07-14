@@ -2,21 +2,32 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-9B 8xGPU fully async training script.
+# Qwen3.5-35B-A3B 16xNPU colocate training script.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen35-9B-8xnpu-async.sh
+#   bash scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh
 
 set -ex
 set -o pipefail
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+ulimit -n 65535
+
+export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp23s0f3}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp23s0f3}"
+export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-enp23s0f3}"
+export HCCL_CONNECT_TIMEOUT=1200
+export RAY_DEDUP_LOGS=0
+export PYTHONBUFFERED=1
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 export ASCEND_COREDUMP_SIGNAL=none
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63050
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64050
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TMS_HOOK_MODE="preload"
+export HYDRA_FULL_ERROR=1
 
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -24,25 +35,22 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
-# Support setting env from outside
-EXP_DIR="${EXP_DIR:-/root/exps}"
-MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
-DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
+source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B/
-   --ref-load ${MODEL_DIR}/Qwen3.5-9B/
+   --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B
+   --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
-   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
-   --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
-   --save-interval 50
-   --max-actor-ckpt-to-keep 1
+   # --load ${EXP_DIR}/Qwen3.5-35B-A3B-save
+   --save ${EXP_DIR}/Qwen3.5-35B-A3B-save
+   --save-interval 100
 )
 
-PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
@@ -62,20 +70,20 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --log-passrate
-   --skip-eval-before-train
    --eval-interval 20
+   --skip-eval-before-train
    --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192
-   --eval-top-p 0.7
+   #--eval-top-p 0.7
 )
 
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
+   --pipeline-model-parallel-size 2
    --context-parallel-size 1
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
@@ -91,7 +99,7 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   # --use-kl-loss
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -110,12 +118,14 @@ OPTIMIZER_ARGS=(
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
+   --use-distributed-optimizer
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --rollout-num-gpus-per-engine 8
+   --sglang-mem-fraction-static 0.6
+   --sglang-max-running-requests 256
+   --sglang-cuda-graph-bs 4 8 16 32 64 128 192 256
    --sglang-device npu
    --sglang-disable-radix-cache
    --sglang-chunked-prefill-size 8192
@@ -123,17 +133,7 @@ SGLANG_ARGS=(
    --sglang-enable-dp-attention
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
-   --sglang-max-running-requests 256
 )
-
-WANDB_ARGS=(
-   --use-tensorboard
-   --use-clearml
-   --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9B-GRPO-4x-sync-${now}
-)
-
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -148,24 +148,21 @@ MISC_ARGS=(
 )
 
 mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+   ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${MASTER_ADDR}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'\
-   --max-staleness 2 \
-   --num-data-storage-units 1 \
-   --num-iters-per-train-update 32 \
-   --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
-   --fully-async \
-    --use-health-check \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-npu8-async-${now}.log
+   --resource '{"actor": [1, 16], "rollout": [1, 16]}'\
+   --max-staleness 0 \
+   --colocate \
+   --num-gpus-per-node 16 \
+   --use-health-check \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-MATH-gpu16-sync-${now}.log
