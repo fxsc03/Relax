@@ -33,12 +33,22 @@ from urllib3.exceptions import NewConnectionError
 
 from relax.backends.megatron.weight_conversion import convert_to_hf
 from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
+from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _adapter_base_prefix, _base_param_prefix
+from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import (
+    LORA_ADAPTER_NAME,
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+)
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -126,6 +136,19 @@ class DeviceDirectBackend(CommBackend):
 
             self._bridge_converter = BridgeConverter(args=args, model=model, quantization_config=quantization_config)
 
+        # LoRA weight-sync state. Mirrors the colocate UpdateWeightFromTensor fields so the
+        # fully-async path supports both merge mode (fold adapter into base, reuse the NCCL
+        # broadcast) and adapter mode (base synced once, adapter pushed to SGLang each step).
+        self._lora_enabled = is_lora_enabled(args)
+        self._lora_merge_mode = is_lora_merge_mode(args) if self._lora_enabled else False
+        self._lora_adapter_mode = is_lora_adapter_mode(args) if self._lora_enabled else False
+        # Cross-call state (the backend instance is long-lived across update_weights_for_rollout).
+        # Adapter-mode incremental-sync state (base-once + adapter-delta protocol) lives in the
+        # shared LoraAdapterSync helper; the merge-mode fields below stay on the backend.
+        self._lora_sync = LoraAdapterSync(args, model) if self._lora_adapter_mode else None
+        self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
+        self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
+
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
         """Build a stable signature of the rollout topology.
@@ -186,6 +209,10 @@ class DeviceDirectBackend(CommBackend):
         return futures
 
     def _healthcheck_rollout_engines(self, timeout_seconds: int = 5) -> set[int]:
+        # Allow raising the cold-start healthcheck timeout via env for slow starts.
+        env_timeout = Envs.RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT
+        if env_timeout is not None:
+            timeout_seconds = env_timeout
         failed_ranks = set()
         futures_to_rank = {}
 
@@ -245,7 +272,7 @@ class DeviceDirectBackend(CommBackend):
                 logger.warning(f"Error killing RolloutEngine #{rank}: {e}")
         self.rollout_engines.clear()
 
-    def _update_rollout_engines(self, max_retries: int = 30, retry_interval: float = 10.0):
+    def _update_rollout_engines(self, max_retries: int = 30, retry_interval: float = 10.0) -> None:
         """Wait for rollout engines to be ready with retries.
 
         In fully-async mode, Rollout engines may still be initializing (loading model)
@@ -254,10 +281,12 @@ class DeviceDirectBackend(CommBackend):
 
         Args:
             max_retries: Maximum number of retry attempts (default: 30).
-            retry_interval: Seconds to wait between retries (default: 2.0).
+            retry_interval: Seconds to wait between retries (default: 10.0).
 
         Raises:
-            RuntimeError: If no healthy engines are available after all retries.
+            RuntimeError: Only if **no** healthy engine remains after all
+                retries. Engines that stay unhealthy are pruned and the weight
+                sync proceeds with whatever engines are still healthy.
         """
         if not self.rollout_topology:
             raise RuntimeError("No rollout engines configured")
@@ -276,11 +305,27 @@ class DeviceDirectBackend(CommBackend):
             )
             time.sleep(retry_interval)
 
-        # All retries exhausted, remove failed engines and report error
-        logger.error(f"Removing failed engines after {max_retries} retries: {failed_ranks}")
-        self._remove_failed_engines(failed_ranks)
+        # All retries exhausted. Prune whatever is still unhealthy and continue
+        # with the engines that remain healthy, instead of unconditionally
+        # raising. Only give up (and let the caller trigger recovery) when *no*
+        # healthy engine is left. Previously this raised even when healthy
+        # engines remained (e.g. a dead scale-out engine while the seed was
+        # fine), which failed the actor weight sync and escalated to a full
+        # global restart -- losing all training progress. Pruning here also
+        # updates ``self.rollout_topology`` (via ``_remove_failed_engines``), so
+        # the caller rebuilds the weight-update group over the surviving set.
+        final_failed = self._healthcheck_rollout_engines()
+        if final_failed:
+            logger.error(f"Pruning engines still unhealthy after {max_retries} retries: {final_failed}")
+            self._remove_failed_engines(final_failed)
 
-        raise RuntimeError(f"No healthy rollout engines available after {max_retries} retries")
+        if not self.rollout_engines:
+            raise RuntimeError(f"No healthy rollout engines available after {max_retries} retries")
+
+        if final_failed:
+            logger.warning(
+                f"Proceeding with {len(self.rollout_engines)} healthy rollout engine(s) after pruning {final_failed}"
+            )
 
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
@@ -427,9 +472,14 @@ class DeviceDirectBackend(CommBackend):
                     f"Failed to init process group for rollout after {max_retries} attempts"
                 ) from last_error
 
-            # Group successfully (re)built — remember the topology it serves so the
-            # next update with the same topology takes the reuse fast path above.
-            self._rollout_topology_signature = new_sig
+            # Group successfully (re)built — remember the topology it actually
+            # serves so the next update with the same topology takes the reuse
+            # fast path above. Recompute from ``self.rollout_topology`` rather
+            # than the pre-check ``new_sig`` because ``_update_rollout_engines``
+            # may have pruned dead engines from it; storing the stale full
+            # signature would let the fast path reuse a group that is missing a
+            # since-recovered engine (orphaning it).
+            self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -516,6 +566,14 @@ class DeviceDirectBackend(CommBackend):
         """
         self.weight_version += 1
 
+        # LoRA: in merge mode, pre-gather every adapter to a full tensor so each base weight can
+        # be folded before conversion (reuses the existing NCCL broadcast). In adapter mode, the
+        # base is broadcast to rollout only on the first sync; afterwards only the adapter dir is
+        # refreshed via SGLang's /load_lora_adapter (see the adapter push below).
+        if self._lora_merge_mode:
+            self._lora_adapter_full = self._collect_full_adapter_tensors()
+        self._lora_skip_rollout_base = self._lora_adapter_mode and self._lora_sync.base_sync_done
+
         if not actor_fwd_only:
             if dist.get_rank() == 0:
                 # Pause generation on all rollout nodes
@@ -552,7 +610,7 @@ class DeviceDirectBackend(CommBackend):
         if converted_named_tensors or origin_named_tensors:
             if not rollout_only:
                 self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
-            if not actor_fwd_only:
+            if converted_named_tensors and not actor_fwd_only:
                 self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
                 converted_named_tensors.clear()
             origin_named_tensors.clear()
@@ -590,6 +648,15 @@ class DeviceDirectBackend(CommBackend):
                 response.raise_for_status()
             dist.barrier(group=get_gloo_group())
 
+        # Adapter mode: (re)register the trained LoRA adapter on every rollout engine. The base
+        # was already broadcast above on the first sync; each engine reads the same shared adapter
+        # directory. Must run on ALL ranks (the export/gather/barrier inside are collective); only
+        # rank 0 writes the file and issues the HTTP fan-out.
+        if self._lora_adapter_mode and not actor_fwd_only:
+            self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
+            self._lora_sync.adapter_loaded = True
+            self._lora_sync.base_sync_done = True
+
         if not actor_fwd_only:
             if dist.get_rank() == 0:
                 # Continue generation on all rollout nodes
@@ -602,6 +669,8 @@ class DeviceDirectBackend(CommBackend):
             # topology actually changes (inside init_process_group_for_rollout's
             # rebuild path).
 
+        # Free the per-call merge-mode adapter cache (full tensors) before reclaiming CUDA memory.
+        self._lora_adapter_full = None
         # Release fragmented CUDA reserved memory left behind by the
         # all_gather + HF-convert buffers that were allocated and freed
         # during the weight update loop.  Without this, the caching
@@ -634,19 +703,28 @@ class DeviceDirectBackend(CommBackend):
             if converted_named_tensors or origin_named_tensors:
                 if not rollout_only:
                     self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
-                if not actor_fwd_only:
+                if converted_named_tensors and not actor_fwd_only:
                     self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
                     converted_named_tensors.clear()
                 origin_named_tensors.clear()
                 buffer_size = 0
         origin_named_tensors += [(name, param)]
-        if not actor_fwd_only:
-            if self._use_bridge:
-                converted_named_tensors += self._bridge_converter.convert(name, param)
+        if not actor_fwd_only and not self._lora_skip_rollout_base:
+            if self._lora_enabled and is_lora_adapter_param(name):
+                # Adapter params never go to the rollout via convert: merge mode folds them into
+                # the base weight below; adapter mode pushes them through SGLang's /load_lora_adapter.
+                # (They ARE still sent raw to actor_fwd via origin_named_tensors above.)
+                pass
             else:
-                converted_named_tensors += convert_to_hf(
-                    self.args, self.model_name, name, param, self.quantization_config
-                )
+                convert_param = param
+                if self._lora_merge_mode:
+                    convert_param = self._merge_full_base(name, param)
+                if self._use_bridge:
+                    converted_named_tensors += self._bridge_converter.convert(name, convert_param)
+                else:
+                    converted_named_tensors += convert_to_hf(
+                        self.args, self.model_name, name, convert_param, self.quantization_config
+                    )
         buffer_size += param_size
         return buffer_size
 
@@ -664,6 +742,14 @@ class DeviceDirectBackend(CommBackend):
 
         HF conversion is deferred until bucket flush.
         """
+        if self._lora_enabled and is_lora_adapter_param(name):
+            # Grouped-expert (MoE) LoRA is not supported in the fully-async path yet: the merge
+            # math differs from dense (per-expert slicing), and no target MoE+LoRA run exists.
+            # Fail loud rather than silently drop the adapter or re-trigger the bridge assertion.
+            raise NotImplementedError(
+                "MoE (grouped-expert) LoRA is not supported in fully-async weight sync. "
+                "Use a dense model, or colocate mode for expert LoRA."
+            )
         param = all_gather_param(self.args, name, param)
 
         param_size = param.numel() * param.element_size()
@@ -860,6 +946,108 @@ class DeviceDirectBackend(CommBackend):
                     handle.wait()
 
                 load_weight(self.args, self.model, weights)
+
+    # ------------------------------------------------------------------
+    # LoRA weight sync (fully-async)
+    # ------------------------------------------------------------------
+
+    def _collect_full_adapter_tensors(self) -> dict[str, dict[str, torch.Tensor]]:
+        """TP-gather every LoRA adapter param to a FULL tensor, keyed by base-
+        weight prefix.
+
+        Merge mode uses this so each base weight can be folded with its adapter
+        (tp_size=1, no further collective) inside the PP-src-only convert step.
+        Called on ALL ranks in identical param order at the top of
+        ``update_weights_for_rollout`` so the TP all-gathers stay in lockstep.
+        Adapter tensors are small; gathering them here (in addition to the main
+        loop's gather for actor_fwd) is cheap.
+        """
+        adapter_full: dict[str, dict[str, torch.Tensor]] = {}
+        for name, param in named_params_and_buffers(self.args, self.model):
+            if not is_lora_adapter_param(name):
+                continue
+            # Mirror all_gather_param's own guard: replicated (non-TP) adapter dims lack the
+            # tensor_model_parallel attr and are already full.
+            if not getattr(param, "tensor_model_parallel", False):
+                full = param.data
+            else:
+                full = all_gather_param(self.args, name, param)
+            slot = adapter_full.setdefault(_adapter_base_prefix(name), {})
+            slot["in" if ".linear_in." in name else "out"] = full
+        return adapter_full
+
+    def _merge_full_base(self, name: str, param: torch.Tensor) -> torch.Tensor:
+        """Return ``base + (alpha/dim)·(B @ A)`` as a NEW full tensor (merge mode).
+
+        ``param`` is the already-TP-gathered full base weight; the paired adapter tensors were
+        gathered to full in ``_collect_full_adapter_tensors``. Uses ``LoRAMerge`` with
+        ``tp_size=1`` so no collective runs here (safe on the PP-src-only path). Never mutates
+        ``param`` (which may alias the model's live weight when TP=1). Unpaired weights
+        (layernorm/embed/router) pass through unchanged.
+        """
+        slot = self._lora_adapter_full.get(_base_param_prefix(name)) if self._lora_adapter_full else None
+        if not slot or "in" not in slot or "out" not in slot:
+            return param
+        from megatron.bridge.peft.lora import LoRAMerge
+
+        return (
+            LoRAMerge()
+            .merge(
+                param.float(),
+                slot["out"].float(),
+                slot["in"].float(),
+                self.args.lora_alpha,
+                self.args.lora_rank,
+                tp_size=1,
+                tp_group=None,
+            )
+            .to(param.dtype)
+        )
+
+    def _push_lora_adapter_distributed(self, *, first_sync: bool) -> None:
+        """Export the HF adapter, write it ONCE to shared storage, and
+        (re)register it on every rollout SGLang engine via the disk-based
+        ``/load_lora_adapter`` endpoint.
+
+        Mirrors the colocate ``UpdateWeightFromTensor._push_lora_adapter`` but fans out to all
+        (distributed) engines from rank 0 via ``_batch_request`` instead of a per-engine IPC load.
+
+        Collective contract: every rank runs the export, the PP gather, and the barrier in
+        lockstep; only rank 0 writes the file and issues the HTTP fan-out (both non-collective).
+        """
+        # Delta-skip: skip the whole push when no adapter param changed beyond threshold. MUST be
+        # a collective decision (each rank owns different adapter shards) or the gather would hang.
+        all_params = dict(named_params_and_buffers(self.args, self.model, convert_to_global_name=False))
+        unchanged, new_state = self._lora_sync.should_skip(all_params)
+        if not first_sync and unchanged:
+            logger.debug("LoRA adapter unchanged on all ranks, skipping adapter push")
+            self._lora_sync.prev_state = new_state
+            return
+
+        # Export full HF-format adapter tensors (bridge TP-gathers internally), then gather across
+        # PP to rank 0 (== PP-rank 0) for a single write; other ranks get None.
+        local_adapter = self._lora_sync.export_local_adapter(all_params)
+        merged = self._lora_sync.gather_full_adapter(local_adapter, all_gather=False)
+
+        adapter_dir = self._lora_sync.live_dir()
+        if dist.get_rank() == 0:
+            self._lora_sync.write_adapter_dir(merged, adapter_dir)
+            logger.info("[lora-adapter] wrote %d tensors to %s", len(merged), adapter_dir)
+        # Ensure the file is fully written before any engine reads it.
+        dist.barrier(group=get_gloo_group())
+
+        # Rank 0 fans out to ALL rollout engines. unload the prior version first (skip on first
+        # sync) so adapters do not accumulate under the fixed name. pinned=False.
+        if dist.get_rank() == 0:
+            if not first_sync:
+                ray.get(self._batch_request("/unload_lora_adapter", {"lora_name": LORA_ADAPTER_NAME}))
+            ray.get(
+                self._batch_request(
+                    "/load_lora_adapter",
+                    {"lora_name": LORA_ADAPTER_NAME, "lora_path": adapter_dir, "pinned": False},
+                )
+            )
+        self._lora_sync.prev_state = new_state
 
 
 @ray.remote

@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from argparse import Namespace
+from typing import Any
 
 import ray
 import transfer_queue as tq
@@ -19,7 +20,7 @@ except ImportError as e:
     raise ImportError(
         "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
         '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps\n'
+        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
         "or use the latest image."
     ) from e
 
@@ -32,6 +33,7 @@ from relax.core.optional_roles import register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
+from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -43,6 +45,7 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
+from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
 
@@ -51,9 +54,29 @@ def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
     return ROLES.rollout in serve_dict
 
 
+def _is_colocate(config: Namespace) -> bool:
+    """True when actor/rollout (and optionally critic) share GPUs."""
+    return not getattr(config, "fully_async", False) and not getattr(config, "hybrid", False)
+
+
 logger = get_logger(__name__)
 
-ACTOR_ROLLOUT_PG_ROLES = [ROLES.actor, ROLES.rollout, "genrm"]
+ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
+
+
+def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
+    """Roles that share the actor/rollout placement group.
+
+    PPO co-hosts the critic on the same GPUs only when its resource entry
+    matches the actor's; otherwise critic runs on its own placement group.
+    """
+    roles = list(ACTOR_ROLLOUT_PG_ROLES)
+    if getattr(config, "advantage_estimator", None) != "ppo":
+        return roles
+    resource = getattr(config, "resource", None) or {}
+    if resource.get("critic") == resource.get("actor"):
+        roles.append("critic")
+    return roles
 
 
 class Controller:
@@ -133,7 +156,7 @@ class Controller:
             # Fully-async + dynamic-batch path streams data per DP via token
             # budget; the controller-side sampler maintains per-DP buckets and
             # balances tokens at small-unit granularity.  See
-            # docs/draft/dynamic_batch_size_fully_async.md.
+            # docs/zh/guide/fully-async-training.md.
             sampler = StreamingTokenBudgetSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
             )
@@ -259,11 +282,13 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to report fatal error to metrics service: {e}")
 
-    def _create_service_task(self, role, cls, num_gpus, data_source, actor_rollout_pgs):
+    def _create_service_task(self, role, cls, num_gpus, data_source, actor_rollout_pgs, actor_rollout_pg_roles=None):
         """Create a single service.
 
         Returns (role, service, error).
         """
+        if actor_rollout_pg_roles is None:
+            actor_rollout_pg_roles = ACTOR_ROLLOUT_PG_ROLES
         try:
             service = Service(
                 cls,
@@ -272,7 +297,7 @@ class Controller:
                 config=self.config,
                 num_gpus=num_gpus,
                 data_source=data_source,
-                actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in ACTOR_ROLLOUT_PG_ROLES else None,
+                actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
                 runtime_env=self.runtime_env,
             )
             logger.info(f"Service {role} has been created successfully")
@@ -322,7 +347,37 @@ class Controller:
                 f"or switch to colocate mode to share GPUs between actor and rollout."
             )
 
+    def _maybe_resolve_num_rollout(self, roles_to_create):
+        # Resolve --num-rollout from --num-epoch here, before any service is
+        # deployed: services pickle self.config, so resolving later (inside the
+        # Rollout actor) leaves Actor/Critic with num_rollout=None and breaks
+        # args.train_iters. SFT is already pre-resolved in __init__, so this only
+        # fills the RL "--num-epoch without --num-rollout" case.
+        if self.config.num_rollout is not None:
+            return
+        if getattr(self.config, "num_epoch", None) is None:
+            return
+        rollout_data_source = None
+        for role, _cls, _num_gpus, ds in roles_to_create:
+            if str(role) == "rollout" and ds is not None:
+                rollout_data_source = ds
+                break
+        if rollout_data_source is None:
+            return
+        num_rollout_per_epoch = ray.get(rollout_data_source.lengths.remote()) // self.config.rollout_batch_size
+        self.config.num_rollout = num_rollout_per_epoch * self.config.num_epoch
+        assert self.config.num_rollout > 0, (
+            f"Resolved num_rollout={self.config.num_rollout} from num_epoch={self.config.num_epoch} and "
+            f"num_rollout_per_epoch={num_rollout_per_epoch}; check dataset size vs rollout_batch_size."
+        )
+        logger.info(
+            f"Resolved --num-rollout={self.config.num_rollout} from --num-epoch={self.config.num_epoch} "
+            f"(num_rollout_per_epoch={num_rollout_per_epoch})"
+        )
+
     def register_all_serve(self):
+        validate_ppo_config(self.config)
+
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
@@ -370,13 +425,19 @@ class Controller:
 
             roles_to_create.append((role, cls, num_gpus, data_source))
 
-        self._validate_gpu_resources(roles_to_create, colocate, ACTOR_ROLLOUT_PG_ROLES)
+        self._maybe_resolve_num_rollout(roles_to_create)
+
+        actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
+        self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
 
         if colocate and not self.config.hybrid:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             if actor_rollout_pgs is None:
                 num_gpus = self.config.resource.get(ROLES.actor)[1]
-                actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
+                actor_rollout_pgs = create_placement_group(
+                    num_gpus=num_gpus,
+                    node_group_affinity=self.config.enable_affinity,
+                )
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
@@ -386,7 +447,9 @@ class Controller:
             # Serial/blocking creation to preserve placement-group ordering
             logger.info("Using serial creation mode (fully_async=False)")
             for role, cls, num_gpus, data_source in roles_to_create:
-                role, service, error = self._create_service_task(role, cls, num_gpus, data_source, actor_rollout_pgs)
+                role, service, error = self._create_service_task(
+                    role, cls, num_gpus, data_source, actor_rollout_pgs, actor_rollout_pg_roles
+                )
                 if error is not None:
                     raise RuntimeError(f"Failed to create service {role}: {error}")
                 self.serve_dict[role] = service  # type: ignore
@@ -401,7 +464,13 @@ class Controller:
                 futures_dict = {}
                 for role, cls, num_gpus, data_source in roles_to_create:
                     future = executor.submit(
-                        self._create_service_task, role, cls, num_gpus, data_source, actor_rollout_pgs
+                        self._create_service_task,
+                        role,
+                        cls,
+                        num_gpus,
+                        data_source,
+                        actor_rollout_pgs,
+                        actor_rollout_pg_roles,
                     )
                     futures_dict[future] = role
 
@@ -507,6 +576,35 @@ class Controller:
                 if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
                     rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
                     await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
+
+                    # Colocate wiring topology:
+                    #   - actor.rollout_barrier: always, so wake_up doesn't
+                    #     collide with SGLang's static KV pool.
+                    #   - critic.rollout_barrier / actor.peer_barrier /
+                    #     rollout.peer_barrier: only when critic is co-hosted
+                    #     (PPO colocate). GRPO has no third GPU claimant.
+                    # In fully_async / hybrid nothing is wired and every
+                    # barrier-guarded site short-circuits.
+                    if _is_colocate(self.config):
+                        rollout_barrier = RolloutOffloadBarrier(rollout_manager, logger=logger)
+                        actor_set_kwargs: dict[str, Any] = {"rollout": rollout_barrier}
+                        if ROLES.critic in self.serve_dict:
+                            critic_handle = self.serve_dict[ROLES.critic].handle
+                            actor_handle = self.serve_dict[ROLES.actor].handle
+                            await self.serve_dict[ROLES.critic].set_barriers(rollout=rollout_barrier)
+                            actor_set_kwargs["peers"] = PeerStepBarrier(
+                                {ROLES.critic.value: critic_handle}, logger=logger
+                            )
+                            await self.serve_dict[ROLES.rollout].set_barriers(
+                                peers=PeerStepBarrier(
+                                    {
+                                        ROLES.actor.value: actor_handle,
+                                        ROLES.critic.value: critic_handle,
+                                    },
+                                    logger=logger,
+                                ),
+                            )
+                        await self.serve_dict[ROLES.actor].set_barriers(**actor_set_kwargs)
 
                 if self.config.fully_async and not self.config.hybrid and ROLES.actor in self.serve_dict:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services

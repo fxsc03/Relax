@@ -15,7 +15,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +24,7 @@ from ray import serve
 from starlette.requests import ClientDisconnect
 
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
+from relax.agentic.pipeline import ExportMode
 from relax.agentic.pipeline.runtime import (
     BackendContextLengthExceededError,
     SGLangBackendAdapter,
@@ -39,7 +40,6 @@ from relax.agentic.profile import (
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
-    MsgNode,
     RequestKind,
     SessionForest,
     TrainingFieldArtifact,
@@ -49,7 +49,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
-from relax.utils.http_utils import get, init_http_client, post
+from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 
 
@@ -63,6 +63,19 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "0",
 }
+
+
+def _resolve_fastapi_request_endpoint(func: Callable[..., Any]) -> Callable[..., Any]:
+    # Ray Serve registers this class-bound route while FastAPI inspects its signature.
+    # Resolve postponed annotations first so FastAPI 0.139 injects Request instead of
+    # treating `request` as a required query parameter.
+    func.__annotations__["request"] = Request
+    func.__annotations__["return"] = JSONResponse
+    return func
+
+
+class _NonFinalizableExportError(RuntimeError):
+    pass
 
 
 def agentic_session_shard_name(index: int) -> str:
@@ -309,14 +322,14 @@ async def _sglang_worker_urls(args: Namespace) -> list[str]:
                 if isinstance(worker, dict) and worker.get("url") and bool(worker.get("is_healthy", False))
             ]
             if urls:
-                return urls
+                return router_worker_base_urls(urls)
     except Exception as exc:
         worker_query_error = exc
     try:
         response = await get(f"{base_url}/list_workers")
         urls = response.get("urls", [])
         if isinstance(urls, list):
-            return [url for url in urls if isinstance(url, str) and url]
+            return router_worker_base_urls(url for url in urls if isinstance(url, str) and url)
     except Exception as exc:
         if worker_query_error is not None:
             raise RuntimeError("Failed to query worker urls from both /workers and /list_workers") from exc
@@ -1125,14 +1138,14 @@ class AgenticSessionShard:
         parent_state_hash: str,
         observation_rollout_tokens: list[int],
     ) -> None:
-        rollout_max_context_len = self.args.rollout_max_context_len
-        if rollout_max_context_len is None:
+        max_context_len = self.args.eval_max_context_len if self._evaluating > 0 else self.args.rollout_max_context_len
+        if max_context_len is None:
             return
         prompt_tokens = forest.rollout_token_count(parent_state_hash) + len(observation_rollout_tokens)
-        if prompt_tokens < int(rollout_max_context_len):
+        if prompt_tokens < int(max_context_len):
             return
         error = _openai_context_length_error_result(
-            max_context_len=rollout_max_context_len,
+            max_context_len=max_context_len,
             prompt_tokens=prompt_tokens,
         )["error"]
         raise AgenticChatRequestError(
@@ -1262,9 +1275,9 @@ class AgenticSessionShard:
     ) -> dict[str, Any]:
         budgeted = dict(sampling_params)
         current_context_tokens = forest.rollout_token_count(generation_parent_hash)
-        rollout_max_context_len = self.args.rollout_max_context_len
-        if rollout_max_context_len is not None:
-            context_budget = max(0, int(rollout_max_context_len) - current_context_tokens)
+        max_context_len = self.args.eval_max_context_len if self._evaluating > 0 else self.args.rollout_max_context_len
+        if max_context_len is not None:
+            context_budget = max(0, int(max_context_len) - current_context_tokens)
             if "max_new_tokens" in budgeted:
                 budgeted["max_new_tokens"] = min(int(budgeted["max_new_tokens"]), context_budget)
             else:
@@ -1505,7 +1518,9 @@ class AgenticSessionShard:
                     record,
                     ir.request_id,
                     result=_openai_context_length_error_result(
-                        max_context_len=self.args.rollout_max_context_len,
+                        max_context_len=self.args.eval_max_context_len
+                        if self._evaluating > 0
+                        else self.args.rollout_max_context_len,
                         prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
                     ),
                 )
@@ -1759,7 +1774,9 @@ class AgenticSessionShard:
                     record,
                     ir_id,
                     result=_openai_context_length_error_result(
-                        max_context_len=self.args.rollout_max_context_len,
+                        max_context_len=self.args.eval_max_context_len
+                        if self._evaluating > 0
+                        else self.args.rollout_max_context_len,
                         prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
                         requested_completion_tokens=ir.sampling_params.get("max_new_tokens"),
                     ),
@@ -2020,54 +2037,167 @@ class AgenticSessionShard:
             "evaluating": self._evaluating,
         }
 
-    def _finalize_sample_from_leaf(
+    def _build_sample_from_state_hash(
         self,
         *,
         record: _SessionRecord,
-        leaf_node: MsgNode,
+        state_hash: str,
         reward: float | dict[str, Any] | None,
         metadata: dict[str, Any] | None,
+        mutate_node: bool,
     ):
+        if state_hash not in record.forest.nodes_by_hash:
+            raise _NonFinalizableExportError("unknown_state_hash")
         metadata_patch = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
         finalize_started_at = time.time()
-        leaf_profile = agentic_trace_events(leaf_node.export_metadata_patch)
-        mark_agentic_event(leaf_profile, "finalize_start_at", finalize_started_at)
-        if reward is not None:
-            leaf_node.reward = copy.deepcopy(reward)
-        if metadata_patch:
-            leaf_node.export_metadata_patch.update(metadata_patch)
+        lineage = record.forest.lineage(state_hash)
+        if not any(node.kind == "resp" for node in lineage):
+            raise _NonFinalizableExportError("no_committed_response")
+        node = record.forest.nodes_by_hash[state_hash]
+        node_profile = agentic_trace_events(node.export_metadata_patch)
+        mark_agentic_event(node_profile, "finalize_start_at", finalize_started_at)
+        if mutate_node:
+            if reward is not None:
+                node.reward = copy.deepcopy(reward)
+            if metadata_patch:
+                node.export_metadata_patch.update(metadata_patch)
         sample = record.forest.build_sample(
-            leaf_state_hash=leaf_node.state_hash,
+            leaf_state_hash=state_hash,
             tokenizer=self.backend.tokenizer,
             # mask_offpolicy_in_partial_rollout=bool(
             #     self.args.partial_rollout and self.args.mask_offpolicy_in_partial_rollout
             # ),
         )
+        if not mutate_node and reward is not None:
+            sample.reward = copy.deepcopy(reward)
+        if not mutate_node and metadata_patch:
+            sample.metadata.update(metadata_patch)
         finalize_ended_at = time.time()
         mark_metadata_agentic_event(sample.metadata, "finalize_end_at", finalize_ended_at)
         return sample
 
-    def _exportable_leaf_node(self, record: _SessionRecord) -> MsgNode | None:
+    def _implicit_export_state_hash(self, record: _SessionRecord) -> str:
         if record.forest is None:
-            return None
-        leaf_hashes = record.forest.export_leaf_hashes()
-        if len(leaf_hashes) != 1:
-            return None
-        lineage = record.forest.lineage(leaf_hashes[0])
-        if not any(node.kind == "resp" for node in lineage):
-            return None
-        return lineage[-1]
+            raise _NonFinalizableExportError("no_committed_response")
+        exportable_leaf_hashes = []
+        for leaf_hash in record.forest.export_leaf_hashes():
+            lineage = record.forest.lineage(leaf_hash)
+            if any(node.kind == "resp" for node in lineage):
+                exportable_leaf_hashes.append(leaf_hash)
+        if not exportable_leaf_hashes:
+            raise _NonFinalizableExportError("no_committed_response")
+        if len(exportable_leaf_hashes) != 1:
+            raise _NonFinalizableExportError("multiple_exportable_leaves")
+        return exportable_leaf_hashes[0]
+
+    def _explicit_export_state_hash(self, record: _SessionRecord, output_record: dict[str, Any]) -> str:
+        if record.forest is None:
+            raise _NonFinalizableExportError("no_committed_response")
+        chat_template_kwargs = {
+            **self._template_kwargs(),
+            **output_record.get("chat_template_kwargs", {}),
+        }
+        state_hash = _messages_tools_template_state_hash(
+            output_record["messages"],
+            output_record.get("tools", []),
+            chat_template_kwargs,
+        )
+        if state_hash not in record.forest.nodes_by_hash:
+            raise _NonFinalizableExportError("unknown_state_hash")
+        return state_hash
 
     @staticmethod
-    def _build_transport_from_sample(sample) -> FinalizedResultTransport:
-        artifact = TrainingFieldArtifact.from_sample(sample)
+    def _assistant_token_spans(sample) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        for idx, mask in enumerate(sample.loss_mask):
+            if mask and start is None:
+                start = idx
+            elif not mask and start is not None:
+                spans.append((start, idx))
+                start = None
+        if start is not None:
+            spans.append((start, len(sample.loss_mask)))
+        return spans
+
+    @classmethod
+    def _unit_payload(cls, *, name: str | None, sample, mode: ExportMode) -> dict[str, Any]:
+        return {
+            "name": name,
+            "mode": mode.value,
+            "assistant_token_spans": cls._assistant_token_spans(sample),
+            "sample_payload": TrainingFieldArtifact.from_sample(sample).sample_payload,
+        }
+
+    @staticmethod
+    def _build_transport_from_unit_payloads(unit_payloads: list[dict[str, Any]]) -> FinalizedResultTransport:
+        artifact = {"units": unit_payloads}
         if ray.is_initialized():
             artifact_ref = ray.put(artifact)
         else:
             artifact_ref = artifact
         return FinalizedResultTransport(
-            status=sample.status.value,
+            status="completed",
             artifact_ref=artifact_ref,
+        )
+
+    def _build_transport_from_output(
+        self,
+        *,
+        record: _SessionRecord,
+        reward: float | dict[str, Any] | None,
+        metadata: dict[str, Any] | None,
+        output_records: list[dict[str, Any]] | None,
+        finalize_arrive_at: float,
+        finalize_lock_acquired_at: float,
+    ) -> FinalizedResultTransport:
+        records = output_records or []
+        if records:
+            unit_payloads = []
+            for output_record in records:
+                state_hash = self._explicit_export_state_hash(record, output_record)
+                node = record.forest.nodes_by_hash.get(state_hash)
+                if node is not None:
+                    profile = agentic_trace_events(node.export_metadata_patch)
+                    mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
+                    mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
+                sample = self._build_sample_from_state_hash(
+                    record=record,
+                    state_hash=state_hash,
+                    reward=output_record.get("reward"),
+                    metadata=output_record.get("metadata"),
+                    mutate_node=False,
+                )
+                unit_payloads.append(
+                    self._unit_payload(
+                        name=output_record["name"],
+                        sample=sample,
+                        mode=ExportMode.EXPLICIT,
+                    )
+                )
+            return self._build_transport_from_unit_payloads(unit_payloads)
+
+        leaf_hash = self._implicit_export_state_hash(record)
+        leaf_node = record.forest.nodes_by_hash.get(leaf_hash)
+        if leaf_node is not None:
+            profile = agentic_trace_events(leaf_node.export_metadata_patch)
+            mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
+            mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
+        sample = self._build_sample_from_state_hash(
+            record=record,
+            state_hash=leaf_hash,
+            reward=reward,
+            metadata=metadata,
+            mutate_node=True,
+        )
+        return self._build_transport_from_unit_payloads(
+            [
+                self._unit_payload(
+                    name=None,
+                    sample=sample,
+                    mode=ExportMode.IMPLICIT,
+                )
+            ]
         )
 
     async def chat(
@@ -2148,7 +2278,9 @@ class AgenticSessionShard:
                         record,
                         ir.request_id,
                         result=_openai_context_length_error_result(
-                            max_context_len=self.args.rollout_max_context_len,
+                            max_context_len=self.args.eval_max_context_len
+                            if self._evaluating > 0
+                            else self.args.rollout_max_context_len,
                             prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
                         ),
                     )
@@ -2285,6 +2417,7 @@ class AgenticSessionShard:
         session_id: str,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
+        output_records: list[dict[str, Any]] | None = None,
     ) -> FinalizedResultTransport:
         finalize_arrive_at = time.time()
         lock = self._get_session_lock(session_id)
@@ -2306,23 +2439,20 @@ class AgenticSessionShard:
                     status="discarded",
                     metadata={"discard_reason": "already_discarded"},
                 )
-            leaf_node = self._exportable_leaf_node(record)
-            if leaf_node is None:
-                transport = FinalizedResultTransport(
-                    status="non_finalizable",
-                    metadata={"discard_reason": "no_committed_response"},
-                )
-            else:
-                profile = agentic_trace_events(leaf_node.export_metadata_patch)
-                mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
-                mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
-                sample = self._finalize_sample_from_leaf(
+            try:
+                transport = self._build_transport_from_output(
                     record=record,
-                    leaf_node=leaf_node,
                     reward=reward,
                     metadata=metadata,
+                    output_records=output_records,
+                    finalize_arrive_at=finalize_arrive_at,
+                    finalize_lock_acquired_at=finalize_lock_acquired_at,
                 )
-                transport = self._build_transport_from_sample(sample)
+            except _NonFinalizableExportError as exc:
+                transport = FinalizedResultTransport(
+                    status="non_finalizable",
+                    metadata={"discard_reason": str(exc)},
+                )
             removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
                 session_id=session_id
             )
@@ -2531,11 +2661,13 @@ class AgenticChatAPIService:
         session_id: str,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
+        output_records: list[dict[str, Any]] | None = None,
     ) -> FinalizedResultTransport:
         return await self._shard_handle(session_id).finalize_and_discard.remote(
             session_id=session_id,
             metadata=metadata,
             reward=reward,
+            output_records=output_records,
         )
 
     async def discard_session(self, *, session_id: str) -> bool:
@@ -2672,6 +2804,19 @@ class AgenticChatAPIService:
             request_payload = _normalized_chat_request(payload)
             session_id = _session_id_from_request(request=request)
         except AgenticChatRequestError as exc:
+            # Surface the reason a chat request is rejected. A rejected request
+            # yields no chat IR, so the whole prepare group is later dropped
+            # ("completed before producing a chat IR"); logging the detail here
+            # is the only place the concrete cause (bad messages/tools, parser
+            # failure, etc.) is visible.
+            if int(getattr(exc, "status_code", 400)) < 500:
+                logger.warning(
+                    "Rejected agentic chat request (status=%s code=%s param=%s): %s",
+                    getattr(exc, "status_code", 400),
+                    getattr(exc, "code", None),
+                    getattr(exc, "param", None),
+                    getattr(exc, "message", str(exc)),
+                )
             return _openai_error_response(_openai_error_from_exc(exc))
         request_ready_at = time.time()
         shard_dispatch_at = time.time()
@@ -2704,6 +2849,22 @@ class AgenticChatAPIService:
                 status_code=499,
             )
         if isinstance(response, dict) and isinstance(response.get("error"), dict):
+            # The shard produced an error instead of a completion (e.g. tool-call
+            # / reasoning parser failed on the model output, or context length
+            # exceeded). This is returned to the agent as a non-2xx and the
+            # session ends without a chat IR, so the prepare group is dropped
+            # downstream. Log the concrete cause here so it is diagnosable.
+            err = response["error"]
+            status = response.get("_http_status", 400)
+            if not isinstance(status, int) or status < 500:
+                logger.warning(
+                    "Agentic chat shard returned error (status=%s code=%s param=%s) for session=%s: %s",
+                    status,
+                    err.get("code"),
+                    err.get("param"),
+                    session_id,
+                    err.get("message"),
+                )
             return _openai_error_response(response)
         service_remote_return_at = time.time()
         service_profile = {
@@ -2762,8 +2923,20 @@ class AgenticChatAPIService:
     @app.post("/")
     @app.post("/chat/completions")
     @app.post("/v1/chat/completions")
+    @_resolve_fastapi_request_endpoint
     async def bare_chat_completions(self, request: Request) -> JSONResponse:
         return await self._chat_completions_impl(request)
+
+    # ``from __future__ import annotations`` (top of this file) stringifies this
+    # signature, and Ray Serve's ``@serve.ingress`` rebuilds each route endpoint
+    # with a ``__globals__`` that does NOT contain this module's imports. FastAPI
+    # then fails to resolve the string ``"Request"`` and silently demotes the
+    # parameter to a required *query* field, so every chat POST is rejected with
+    # HTTP 422 ("loc: [query, request], Field required") before reaching the
+    # handler -- collapsing all agentic rollouts (no chat IR -> every prepare
+    # group dropped -> training stalls). Pinning the real annotation objects lets
+    # the route rebuild skip re-evaluating the stringized names entirely.
+    bare_chat_completions.__annotations__ = {"request": Request, "return": JSONResponse}
 
     @app.get("/models")
     @app.get("/v1/models")

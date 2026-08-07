@@ -12,6 +12,7 @@ import torch
 from tensordict import TensorDict
 
 from relax.utils.device import get_ray_accelerator_name
+from relax.utils.env import Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -178,6 +179,8 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        return raw_rewards, [sample.custom_advantage for sample in samples]
     if (
         args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
@@ -339,9 +342,9 @@ def post_process_env(args, env):
         )
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(batch_size_for_capacity * args.n_samples_per_prompt)
     env["env_vars"]["TQ_ZERO_COPY_SERIALIZATION"] = "true"
-    env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(os.getenv("MASTER_ADDR", "127.0.0.1"))
+    env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(Envs.MASTER_ADDR)
 
-    if os.getenv("RAY_DEBUG", "0") == "1":
+    if Envs.RAY_DEBUG == "1":
         env["env_vars"]["RAY_DEBUG_POST_MORTEM"] = "1"
         env["env_vars"]["RAY_DEBUG"] = "1"
 
@@ -362,7 +365,7 @@ def post_process_env(args, env):
     # ``relax.backends.megatron`` re-runs the imports listed here (analogue
     # of ``--custom-generate-function-path``). Downstream packages register
     # Megatron-Bridge converters / family-token tables this way.
-    extra_modules = os.environ.get("RELAX_EXTRA_MODULES")
+    extra_modules = Envs.RELAX_EXTRA_MODULES
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
 
@@ -370,7 +373,7 @@ def post_process_env(args, env):
     # of env-var names the driver wants forwarded to every Ray actor. Each
     # name is copied from the driver's os.environ; missing names are
     # silently skipped.
-    propagate_list = os.environ.get("RELAX_PROPAGATE_ENV_VARS", "")
+    propagate_list = Envs.RELAX_PROPAGATE_ENV_VARS
     for var in propagate_list.split(","):
         var = var.strip()
         if not var or var in env["env_vars"]:
@@ -380,6 +383,13 @@ def post_process_env(args, env):
             env["env_vars"][var] = val
 
     logger.info(f"Ray runtime env: {env['env_vars']}")
+
+    # Last point where both env sources are merged and still on the driver:
+    # reject unparseable declared variables here, where a single traceback is
+    # readable, rather than letting every worker fail independently later. Also
+    # warns about unregistered RELAX_*/SLIME_* names, which have no effect.
+    validate_env(env["env_vars"])
+
     return env
 
 
@@ -517,6 +527,8 @@ def process_args(args: Namespace, role: str) -> None:
     args.max_tokens_per_gpu = args.log_probs_max_tokens_per_gpu
     args.only_load_weight = True
     if role == "reference":
+        args.load = args.ref_load
+    if role == "actor_fwd":
         args.load = args.ref_load
 
 
