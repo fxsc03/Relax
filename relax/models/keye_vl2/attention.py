@@ -12,6 +12,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from torch import nn
 
+from .dosa import dosa_select, frozen_indexer_enabled
 from .indexer import KeyeIndexer, indexer_scores
 from .sparse_attention import compact_indices, sparse_attention
 from .topk import dsa_topk_indices
@@ -126,6 +127,7 @@ class KeyeCoreAttention(nn.Module):
             and any(parameter.requires_grad for parameter in self.sa_indexer.parameters())
         )
         local_start = 0
+        use_dosa = frozen_indexer_enabled(self.config, self.sa_indexer)
         for start, end in zip(boundaries, boundaries[1:]):
             length = (end - start) // size
             q = query[local_start : local_start + length]
@@ -138,14 +140,35 @@ class KeyeCoreAttention(nn.Module):
             chunk_size = getattr(self.config, "keye_attention_chunk_size", 1024)
             for offset, stop, prefix in query_chunks(length, size, rank, chunk_size):
                 lo, hi = local_start + offset, local_start + stop
-                scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
                 causal = (indices[start : start + prefix][None] <= token_offsets[offset:stop, None]) & valid[
                     start : start + prefix
                 ][None]
-                scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
-                selected = dsa_topk_indices(scores)
-                support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
-                slots, counts = compact_indices(selected, causal.gather(1, selected))
+                selected = None
+                if use_dosa:
+                    selected = dosa_select(
+                        iq[lo:hi],
+                        ik[start : start + prefix],
+                        iw[lo:hi],
+                        token_offsets[offset:stop] - start,
+                        valid[start : start + prefix],
+                        heads=getattr(self.config, "keye_dosa_heads", 4),
+                    )
+                if selected is None:
+                    scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
+                    scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+                    selected = dsa_topk_indices(scores)
+                    selected_valid = causal.gather(1, selected)
+                    support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
+                else:
+                    selected_valid = (selected >= 0) & causal.gather(1, selected.clamp_min(0).long())
+                    selected = selected.clamp_min(0).long()
+                    # Invalid slots cannot overwrite a real selection of token 0.
+                    support = (
+                        torch.zeros_like(causal, dtype=torch.int32)
+                        .scatter_add_(1, selected, selected_valid.int())
+                        .bool()
+                    )
+                slots, counts = compact_indices(selected, selected_valid)
                 chunk_q = q[offset:stop].transpose(0, 1)
                 output = sparse_attention(q[offset:stop], k[:prefix], v[:prefix], slots, counts, support)
                 outputs.append(output.reshape(stop - offset, -1))

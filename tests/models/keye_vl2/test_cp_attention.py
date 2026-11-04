@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _cp_worker(rank: int, init_method: str) -> None:
+def _cp_worker(rank: int, init_method: str, backend: str = "dsa") -> None:
     from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 
     from relax.backends.megatron.cp_utils import gdn_cp_slice
@@ -33,7 +33,11 @@ def _cp_worker(rank: int, init_method: str) -> None:
     base = KeyeCoreAttention(config(1), 1).cuda().bfloat16()
     shard = KeyeCoreAttention(config(2), 1, pg_collection=SimpleNamespace(cp=group)).cuda().bfloat16()
     shard.load_state_dict(base.state_dict())
-    last = 2240
+    if backend == "dosa":
+        base.sa_indexer.requires_grad_(False)
+        shard.sa_indexer.requires_grad_(False)
+        shard.config.keye_dsa_backend = "dosa"
+    last = 4224 if backend == "dosa" else 2240
     cu = [0, 64, last]
     pos = torch.cat([torch.arange(64), torch.arange(last - 64)]).cuda()
     pos = torch.stack([pos // 2, pos // 3, pos // 5], -1)
@@ -56,6 +60,9 @@ def _cp_worker(rank: int, init_method: str) -> None:
     for i in range(3):
         torch.testing.assert_close(local[i].grad, gdn_cp_slice(full[i].grad, cu, 2, rank), atol=0.06, rtol=0.08)
     for (name, p), (_, bp) in zip(shard.named_parameters(), base.named_parameters()):
+        if not p.requires_grad:
+            assert p.grad is None and bp.grad is None
+            continue
         dist.all_reduce(p.grad, group=group)
         torch.testing.assert_close(p.grad, bp.grad, atol=0.02, rtol=0.1)
 
@@ -63,8 +70,9 @@ def _cp_worker(rank: int, init_method: str) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Keye CP gradient regression needs two CUDA devices")
-def test_keye_cp2_matches_cp1_outputs_and_cross_rank_gradients(tmp_path):
-    mp.spawn(_cp_worker, args=(f"file://{tmp_path / 'cp-init'}",), nprocs=2, join=True)
+@pytest.mark.parametrize("backend", ["dsa", "dosa"])
+def test_keye_cp2_matches_cp1_outputs_and_cross_rank_gradients(tmp_path, backend):
+    mp.spawn(_cp_worker, args=(f"file://{tmp_path / 'cp-init'}", backend), nprocs=2, join=True)
 
 
 def _text_cp_worker(rank: int, init_method: str) -> None:

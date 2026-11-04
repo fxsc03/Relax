@@ -24,6 +24,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeForCausalLM, Qwen3MoeModel
 from sglang.srt.runtime_context import get_model, get_parallel
 
+from relax.models.keye_vl2.dosa import backend_config, dosa_select
 from relax.models.keye_vl2.indexer import KeyeIndexer, indexer_scores
 from relax.models.keye_vl2.norm import RMSNorm as StableRMSNorm
 from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
@@ -190,11 +191,23 @@ class KeyeAttention(Qwen3MoeAttention):
             keys = cache[slots].unsqueeze(1)
             for start in range(offset, offset + query_length, 128):
                 end = min(start + 128, offset + query_length)
-                scores = indexer_scores(iq[start:end], keys, iw[start:end])
-                causal = torch.arange(length, device=q.device)[None, :] <= positions[start:end, None]
-                scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
-                selected = dsa_topk_indices(scores)
-                selected_slots, counts = compact_indices(selected, causal.gather(1, selected))
+                # Request-local token order is independent of multimodal RoPE.
+                token_offsets = torch.arange(start - offset, end - offset, device=q.device) + length - query_length
+                causal = torch.arange(length, device=q.device)[None, :] <= token_offsets[:, None]
+                selected = None
+                if getattr(self, "keye_dsa_backend", "dsa") == "dosa":
+                    selected = dosa_select(
+                        iq[start:end], keys, iw[start:end], token_offsets, heads=self.keye_dosa_heads
+                    )
+                if selected is None:
+                    scores = indexer_scores(iq[start:end], keys, iw[start:end])
+                    scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
+                    selected = dsa_topk_indices(scores)
+                    selected_valid = causal.gather(1, selected)
+                else:
+                    selected_valid = (selected >= 0) & causal.gather(1, selected.clamp_min(0).long())
+                    selected = selected.clamp_min(0)
+                selected_slots, counts = compact_indices(selected, selected_valid)
                 result = sparse_attention(q[start:end], all_k, all_v, selected_slots, counts)
                 outputs.append(result.reshape(end - start, -1))
             offset += query_length
@@ -295,6 +308,7 @@ class KeyeVL2MoeForConditionalGeneration(Qwen3MoeForCausalLM):
                 weight.data = weight.new_empty((weight.shape[0], config.num_attention_heads * attention.head_dim))
                 weight.weight_loader = default_weight_loader
             attention.keye_multimodal_enabled = bool(self.multimodal_enabled)
+            attention.keye_dsa_backend, attention.keye_dosa_heads = backend_config(config)
             attention.sa_indexer = KeyeIndexer(config.hidden_size, config.rms_norm_eps, config.rope_theta)
             attention.sa_indexer.q_proj.__class__ = KeyeLinear
             attention.sa_indexer.k_proj.__class__ = KeyeLinear

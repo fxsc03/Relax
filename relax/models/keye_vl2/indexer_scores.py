@@ -9,6 +9,15 @@ from torch.autograd.function import FunctionCtx
 
 
 @triton.jit
+def score_tile(q, k, weights):
+    """The original 16 x 128 x 64 scorer, including every BF16 boundary."""
+    dots = tl.dot(q, k, input_precision="ieee").to(q.dtype).to(tl.float32)
+    scaled = (dots * 0.125).to(q.dtype)
+    weighted = (tl.maximum(scaled.to(tl.float32), 0) * weights[:, None].to(tl.float32)).to(q.dtype)
+    return tl.sum(weighted.to(tl.float32), axis=0).to(q.dtype), scaled
+
+
+@triton.jit
 def _index_scores(
     Q,
     K,
@@ -42,11 +51,9 @@ def _index_scores(
         k = tl.load(K + slots[None, :] * 64 + d[:, None], mask=(n[None, :] < length) & (n[None, :] < WIDTH), other=0)
         # The tile and reduction order do not depend on the sequence length.
         # Preserve each BF16 boundary of matmul -> scale -> weighted ReLU -> sum.
-        dots = tl.dot(q, k, input_precision="ieee").to(q.dtype).to(tl.float32)
-        scaled = (dots * 0.125).to(q.dtype)
         weights = tl.load(W + row * WS + h)
-        weighted = (tl.maximum(scaled.to(tl.float32), 0) * weights[:, None].to(tl.float32)).to(q.dtype)
-        result = tl.sum(weighted.to(tl.float32), axis=0)
+        result, scaled = score_tile(q, k, weights)
+        result = result.to(tl.float32)
         result = tl.where(n < length, result, float("-inf"))
         if SAVE_SCALED:
             tl.store(SCALED + (h[:, None] * ROWS + row) * WIDTH + n[None, :], scaled, mask=n[None, :] < WIDTH)
