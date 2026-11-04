@@ -18,7 +18,7 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 ### Megatron Weights to HF Weights
 
 ::: tip No Manual Conversion Needed with Megatron Bridge
-Relax uses [Megatron Bridge](../../../relax/backends/megatron/mbridge/) as the weight bridging layer for its training backend, automatically handling bidirectional HF ↔ Megatron weight conversion during training — **no manual conversion steps required**. Simply specify the following option in your launch script:
+Relax uses [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) as the weight bridging layer for its training backend, automatically handling bidirectional HF ↔ Megatron weight conversion during training — **no manual conversion steps required**. Simply specify the following option in your launch script:
 :::
 
 ```bash
@@ -103,7 +103,7 @@ We provide conversion scripts for OpenR1 and AVQA datasets in `scripts/tools/`:
 ```bash
 python scripts/tools/process_openr1.py \
   --input-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
-  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001-test.parquet
+  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 
 # --md-dir points to the directory containing image and audio files,
 # used to join relative paths into absolute paths.
@@ -460,6 +460,6 @@ bash scripts/entrypoint/ray-job.sh scripts/training/multimodal/run-qwen35-9B-8xg
 
 ## Getting Help
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [Introduction](../guide/introduction.md)

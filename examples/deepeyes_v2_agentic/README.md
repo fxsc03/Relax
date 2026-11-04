@@ -13,9 +13,13 @@ Reward = `0.8 * acc + 0.2 * format`, accuracy via LLM-judge, routed on
 
 ## One env var: `DATA_DIR`
 
-Everything keys off a single workspace dir. `scripts/prepare.sh` lays out:
+`scripts/prepare.sh` keeps the high-concurrency app environment on node-local
+storage and lays out shared data assets under `DATA_DIR`:
 
 ```
+${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/
+└── .venv/                           (host-side agent environment)
+
 ${DATA_DIR}/
 ├── sif/
 │   └── deepeyes_v2_kernel.sif       (~115 MiB, built locally)
@@ -45,13 +49,17 @@ bash examples/deepeyes_v2_agentic/scripts/prepare.sh
 
 What it does (all idempotent — skips done work on re-run):
 
-1. **SIF** — `apptainer build` from `apptainer_env/deepeyes_v2_kernel.def`, falls
+1. **App environment** — creates a reusable node-local `uv` virtual environment
+   with system site packages and installs the host-side `jupyter_client` used
+   to control the sandbox kernel. Its default location is
+   `/tmp/deepeyes-v2-app-env`; prepare the same path on every training node.
+2. **SIF** — `apptainer build` from `apptainer_env/deepeyes_v2_kernel.def`, falls
    back to `--fakeroot`, verifies kernel deps inside the SIF.
-2. **Train parquets** — downloads `honglyhly/DeepEyesV2_RL` (8 files, ~10 GiB)
-   via `HF_ENDPOINT=https://hf-mirror.com` (override if you have direct HF
-   access), then runs `convert_tool/rl_data_convert.py` to inject
+3. **Train parquets** — downloads `honglyhly/DeepEyesV2_RL` (8 files, ~10 GiB)
+   from the configured Hugging Face endpoint (default `https://huggingface.co`),
+   then runs `convert_tool/rl_data_convert.py` to inject
    `extra_info.data_source`.
-3. **Smoke parquet** — 4 synthetic rows covering all `data_source` values.
+4. **Smoke parquet** — 4 synthetic rows covering all `data_source` values.
 
 Skip individual steps with `SKIP_SIF=1 SKIP_TRAIN=1 SKIP_SMOKE=1`.
 
@@ -77,7 +85,8 @@ For ad-hoc debug with a synthetic input (no parquet needed):
 
 ```bash
 source examples/deepeyes_v2_agentic/env.sh
-python examples/deepeyes_v2_agentic/scripts/run_single_session.py
+${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python \
+    examples/deepeyes_v2_agentic/scripts/run_single_session.py
 ```
 
 ## Train (cluster)
@@ -85,7 +94,7 @@ python examples/deepeyes_v2_agentic/scripts/run_single_session.py
 `DATA_DIR` comes from `env.sh`. Also export `MODEL_DIR` + `SAVE_DIR`:
 
 ```bash
-export MODEL_DIR=...          # contains Qwen3-VL-30B-A3B-Thinking/
+export MODEL_DIR=...          # contains Qwen3.6-35B-A3B/ and Qwen2.5-1.5B-Instruct/
 export SAVE_DIR=...
 
 bash examples/deepeyes_v2_agentic/run_deepeyes_v2_agentic.sh
@@ -95,6 +104,106 @@ The launcher auto-resolves `APPTAINER_IMAGE_PATH = ${DATA_DIR}/sif/deepeyes_v2_k
 and propagates it to every Ray worker via `--runtime-env-json`. Set
 `APPTAINER_IMAGE_PATH` explicitly to override (e.g. shared NFS path for
 multi-node).
+
+## Text search
+
+Text search defaults to a deterministic, offline mock. No search service, network
+or API key is needed; model inference and the Python sandbox retain their normal
+requirements. Select a real backend with one YAML file:
+
+```bash
+export DEEPEYES_V2_SEARCH_CONFIG=/path/to/search.yaml
+```
+
+For a Search-R1-compatible service:
+
+```yaml
+backend: retriever
+retriever:
+  url: http://your-retriever:8000/retrieve
+```
+
+The client sends `POST {"queries": [query], "topk": k, "return_scores": true}`
+and accepts both raw corpus documents and `document`/`score` wrappers inside
+`result[0]`. It preserves `contents` as the snippet. Missing titles use the first
+line of the passage; missing links remain empty rather than inventing URLs.
+
+For [Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search),
+set `DEEPEYES_V2_SEARCH_API_KEY` in your environment and use:
+
+```yaml
+backend: external
+external:
+  endpoint: https://api.tavily.com/search
+  method: POST
+  auth:
+    header: Authorization
+    prefix: "Bearer "
+  request_map:
+    query: query
+    size: max_results
+  response_map:
+    results: results
+    title: title
+    link: url
+    snippet: content
+    date: published_date
+```
+
+`external` supports GET query parameters or POST JSON, configurable header
+authentication, and dot-separated response paths. Omit `auth` for an unauthenticated
+endpoint and omit the date mapping when the API does not provide one. Request
+mapping names must be distinct; no provider SDK is required.
+
+Common settings (all optional):
+
+| Setting       | Default | Meaning                                                         |
+| ------------- | ------- | --------------------------------------------------------------- |
+| `backend`     | `mock`  | `mock`, `retriever`, or `external`                              |
+| `top_k`       | `5`     | Maximum results; an explicit `search(query, size)` overrides it |
+| `timeout_s`   | `10`    | HTTP connect/read timeout, not a total wall-clock deadline      |
+| `max_retries` | `2`     | Retries after the first request; zero means one attempt         |
+| `backoff_s`   | `0.5`   | Initial retry delay; doubles up to 2 seconds                    |
+| `trust_env`   | `false` | Enable environment proxy/netrc settings when needed             |
+
+Successful calls return `elapsed_time` in seconds and `data`, a list of
+`{title, link, snippet, date}` records. Date is a string or null. Empty results
+are successful; malformed responses are errors. Connection failures, timeouts,
+HTTP 408/429 and 5xx statuses are retried. Other HTTP failures (including
+redirects), malformed JSON and configuration errors fail immediately. Failure
+returns the existing `"Error"` sentinel, which becomes a non-terminal
+`search_failed` observation. A broken real backend never falls back to mock.
+Diagnostic logs identify the error without printing credentials or response bodies.
+
+Both training launchers forward the configuration path and API key to Ray workers.
+The YAML must be readable at that path on every node; forwarding a path does not
+upload its file. Credentials are excluded from shell tracing, but Ray runtime
+configuration and submission process arguments may be visible to cluster
+administrators. Use worker-provisioned credentials if that exposure is unsuitable.
+
+CPU tests use a local HTTP server for the Search-R1 and external protocols, plus a
+scripted model to exercise the real Agent loop. They need no search service, GPU
+or Apptainer instance:
+
+```bash
+python -m pytest tests/examples/deepeyes_v2_agentic -q
+```
+
+To check your configured service separately, from the repository root:
+
+```bash
+PYTHONPATH=examples/deepeyes_v2_agentic:. python - <<'PYTHON'
+from app.search_utils import search
+
+result = search("What is reinforcement learning?", size=3)
+assert result != "Error", "See the search diagnostic above"
+print(result)
+PYTHON
+```
+
+The protocol tests do not validate a live E5/FAISS deployment or API credentials.
+The repository's native Search-R1 server uses CUDA; the search client itself can
+run on a CPU host, including macOS.
 
 ## Image-search cache (optional, only for the `search` split)
 
@@ -119,7 +228,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | Path                             | Role                                                                                     |
 | -------------------------------- | ---------------------------------------------------------------------------------------- |
 | `env.sh.example`                 | Template for the gitignored `env.sh` — set DATA_DIR + optional knobs                     |
-| `scripts/prepare.sh`             | Single prep entry point — SIF + train data + smoke parquet                               |
+| `scripts/prepare.sh`             | Single prep entry point — app environment + SIF + train data + smoke parquet             |
+| `scripts/prepare_app_env.sh`     | Reusable host-side agent environment                                                     |
 | `scripts/build_smoke_parquet.py` | Synthetic 4-row parquet generator (called by prepare.sh; also runnable standalone)       |
 | `scripts/run_single_session.py`  | Single-trajectory harness (parquet row or synthetic input)                               |
 | `app/agent.py`                   | Per-session agent driver                                                                 |
@@ -130,7 +240,7 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | `reward_deepeyes_v2.py`          | Post-trajectory scorer (data_source-routed, LLM-judge)                                   |
 | `convert_tool/`                  | `rl_data_convert.py` (data_source injection) + `cache_convert.py` (search cache rewrite) |
 | `apptainer_env/`                 | Apptainer image def + sandbox YAML config                                                |
-| `run_deepeyes_v2_agentic.sh`     | Full GRPO launch (Qwen3-VL-30B-A3B-Thinking, colocate)                                   |
+| `run_deepeyes_v2_agentic.sh`     | Full GRPO launch (Qwen3.6-35B-A3B, colocate)                                             |
 | `scripts/smoke.sh`               | Single-sample smoke wrapper (one trajectory through the full app, no Ray)                |
 | `run_agent_app.sh`               | Per-session wrapper invoked by Relax for each rollout                                    |
 | `sglang_judge_service.sh`        | Stands up the LLM-judge SGLang server                                                    |
@@ -138,8 +248,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 ## Pitfalls — read before debugging
 
 Adapting DeepEyes V2 on Relax's agentic stack has a set of recurring
-footguns (SGLang mamba IMA, agentic prepare-gate livelock, "step 1 keeps
-looping" caused by `--use-fault-tolerance` silently masking errors,
+footguns (SGLang mamba IMA, "step 1 keeps looping" caused by
+`--use-fault-tolerance` silently masking errors,
 reward tool-bonus divergence from upstream, …). Before opening py-spy,
 read [`PITFALLS.md`](./PITFALLS.md) — the top entry (don't enable
 `--use-fault-tolerance` during adaptation) alone will save hours.

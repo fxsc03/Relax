@@ -7,9 +7,26 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
+
+
+def _resolve_train_actor_class(args):
+    """Return the train actor class for the configured ``--train-backend``.
+
+    Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
+    selects the FSDP2 actor used by native generative RL (design doc 8.3).
+    """
+    backend = getattr(args, "train_backend", "megatron")
+    if backend == "fsdp":
+        from relax.backends.fsdp.actor import FSDPTrainRayActor
+
+        return FSDPTrainRayActor
+    from relax.backends.megatron.actor import MegatronTrainRayActor
+
+    return MegatronTrainRayActor
 
 
 class RayTrainGroup:
@@ -62,6 +79,12 @@ class RayTrainGroup:
             **self.runtime_env.get("env_vars", {}),
             **self.args.train_env_vars,
         }
+        # Compiler cache paths are train-actor-only.  Putting them in the Job
+        # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
+        if kernel_cache_local_dir:
+            env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
+            env_vars["TRITON_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "triton")
 
         # Only preload the torch_memory_saver hook when it is actually the offload
         # mechanism. --selective-offload uses application-level selective CPU offload
@@ -88,12 +111,10 @@ class RayTrainGroup:
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
-        from relax.backends.megatron.actor import MegatronTrainRayActor
-
-        actor_impl = MegatronTrainRayActor
+        actor_impl = _resolve_train_actor_class(self.args)
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
-        lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
 
         # Create worker actors
         self._actor_handlers = []
@@ -120,6 +141,101 @@ class RayTrainGroup:
             actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
             for actor in self._actor_handlers
         ]
+
+    def init_and_wait(
+        self,
+        args: Any,
+        role: str,
+        with_ref: bool = False,
+        with_opd_teacher: bool = False,
+    ) -> list[Any]:
+        """Initialize every train actor, destroying the group on any failure.
+
+        ``MegatronTrainRayActor.init`` attaches the process-global
+        TransferQueue client from a regular actor method. If its bounded
+        ``tq.init`` times out, the method raises while the native daemon thread
+        may still be running. A failed distributed group cannot be reused
+        safely, so all actor processes are force-killed and confirmed terminal
+        before the initialization error is propagated.
+        """
+        try:
+            # Submission itself can fail after one or more actor calls were
+            # already queued.  Keep it inside the same cleanup boundary as
+            # asynchronous task failures so no partially initialized group is
+            # left reusable.
+            refs = self.async_init(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            pending = list(refs)
+            results: dict[Any, Any] = {}
+            # ``ray.get(refs)`` may wait for every ref before surfacing one
+            # failure. A rank blocked in native initialization would then
+            # prevent cleanup forever, so consume whichever ref finishes first.
+            while pending:
+                ready, pending = ray.wait(pending, num_returns=1)
+                if not ready:
+                    raise RuntimeError("Ray returned no completed train-actor initialization task")
+                ref = ready[0]
+                results[ref] = ray.get(ref)
+            return [results[ref] for ref in refs]
+        except Exception:
+            self._terminate_failed_init()
+            raise
+
+    def _terminate_failed_init(self, timeout: float = 10.0) -> None:
+        """Force-kill a failed train group and confirm its actor tasks
+        ended."""
+        probe_refs = []
+        control_errors: list[str] = []
+
+        # Queue a task that can never return normally before issuing the force
+        # kill. Each ref must later fail with RayActorError, proving that Ray
+        # processed the actor death instead of merely accepting a kill request.
+        for actor in self._actor_handlers:
+            try:
+                probe_refs.append(actor.termination_probe.remote())
+            except ray.exceptions.RayActorError:
+                # The actor was already dead before cleanup reached it.
+                continue
+            except Exception as error:
+                control_errors.append(f"termination probe submission ({type(error).__name__})")
+
+        for actor in self._actor_handlers:
+            try:
+                ray.kill(actor, no_restart=True)
+            except ray.exceptions.RayActorError:
+                continue
+            except Exception as error:
+                control_errors.append(f"actor kill ({type(error).__name__})")
+
+        pending = []
+        ready = []
+        if probe_refs:
+            try:
+                ready, pending = ray.wait(
+                    probe_refs,
+                    num_returns=len(probe_refs),
+                    timeout=timeout,
+                )
+            except Exception as error:
+                control_errors.append(f"termination wait ({type(error).__name__})")
+
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except ray.exceptions.RayActorError:
+                continue
+            except Exception as error:
+                control_errors.append(f"termination probe result ({type(error).__name__})")
+            else:
+                control_errors.append("termination probe returned normally")
+
+        if control_errors or pending:
+            detail = ", ".join(control_errors)
+            if pending:
+                detail = f"{detail}, " if detail else ""
+                detail += f"{len(pending)} task(s) remained pending"
+            raise RuntimeError(f"Failed to confirm train actor cleanup after initialization error: {detail}") from None
+
+        self._actor_handlers = []
 
     def async_train(self, rollout_id):
         """Do one rollout training."""

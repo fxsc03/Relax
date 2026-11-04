@@ -37,21 +37,30 @@ For top-K modes (`student_topk`, `teacher_topk`, `union`), `--opd-norm-mode` con
 
 ## SGLang Patch
 
-When using top-K modes (`student_topk`, `teacher_topk`, `union`), the `RELAX_OPD_PER_POS_TOKEN_IDS` feature requires a source-level patch to SGLang:
+The Relax v0.5.17 training images include the independent per-position top-K patch. Cross-model top-K queries (`student_topk`, `union`, and `teacher_topk` advantage mode) require this patch; stock SGLang queries the same token set at every position. The patch preserves returned query IDs and supports scheduler and logits chunking.
+
+For an existing v0.5.17 environment that does not have the patch, apply it once after the main Relax SGLang patch:
 
 ```bash
 cd /sgl-workspace/sglang
-patch -p1 < /path/to/your/Relax/docker/patch/latest/sglang_per_pos_topk.patch
+git apply --check /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
+git apply /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
 ```
 
-This patch enables per-position token ID log-prob collection, base64 encoding, and `drop_token_ids` optimization in SGLang. It only needs to be applied once at install time.
+## Native Image OPD
+
+Image OPD, OPSD, and MOPD use SGLang v0.5.17 native processing: each request sends collapsed prompt IDs, the original sampled response IDs, and standard base64 images. The client processor still determines the expanded prompt length for logprob alignment. Teacher and student must use compatible tokenizers and image processors, including image resizing settings; audio and video requests are not supported by this path.
+
+When OPSD changes the teacher prompt but supplies no teacher media override, it reuses student images. An explicit empty teacher media mapping selects text-only teacher input. Student cross-top-K prefill always uses student images.
+
+Both direct teacher endpoints and the student router must preserve `return_prompt_token_ids`. Relax checks the full expanded sequence, response logprob IDs, and cross-top-K query IDs before consuming results. Missing or mismatched IDs fail the image request. The text-based `RadixTreeMiddleware` is unsupported for this path. Configure stop tokens for media placeholders; image OPD cannot rewrite sampled response IDs or apply a different teacher EOS ID.
 
 ## Environment Variables
 
-| Variable                      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RELAX_OPD_PREEXPANDED_PATCH` | Set to `1` to enable the multimodal pre-expanded patch. **Required for multimodal OPD**. Because the tokenizer is not idempotent, this passes through parameters so SGLang directly accepts expanded `input_ids + image_data（base64)`; the SGLang-side tokenizer becomes a no-op and will not re-detokenize/tokenize during inference. Default: `0`. Affects both teacher and student engines (in adv mode, student-at-teacher-topk prefill also sends pre-expanded data). |
-| `RELAX_OPD_PER_POS_TOKEN_IDS` | Set to `1` to enable per-position token ID log-prob collection. Changes the SGLang transfer format from `list[[int, float, None]]` to base64 encoding, significantly reducing serialization overhead. **Required** for `student_topk`, `teacher_topk`, `union` modes; not needed for `student_sampled`. Default: `0`. Requires the SGLang patch above.                                                                                                                      |
+| Variable                      | Description                                                                                                                                                                                                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SGLANG_MM_AVOID_RETOKENIZE`  | Set to `true` on native image teacher and student engines. This is the SGLang v0.5.17 default; Relax-managed teachers set it explicitly. External endpoints need the same processor behavior.                            |
+| `RELAX_OPD_PER_POS_TOKEN_IDS` | Set to `1` for compact base64 logprob transport in top-K runs. Requires the independent patch above. Per-position query width is sent in each request, and returned IDs are retained for alignment checks. Default: `0`. |
 
 ## Performance Benchmark
 
@@ -66,9 +75,9 @@ SGLang per-position top-K log-prob transfer optimization (Qwen3-4B, simulated da
 
 ### Text OPD
 
-| Script                                                                                     | Description                                                                                 |
-| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| [`math_opd/run-opd-sampled-8xgpu-colocate.sh`](math_opd/run-opd-sampled-8xgpu-colocate.sh) | Math OPD, Qwen3-4B → Qwen3-4B-Non-Thinking-RL, `student_sampled` + adv mode, 8 GPU colocate |
+| Script                                                                                                   | Description                                                                                                                         |
+| -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| [`math_opd/run-opd-qwen35-35B-A3B-8xgpu-colocate.sh`](math_opd/run-opd-qwen35-35B-A3B-8xgpu-colocate.sh) | Math OPD, student: Qwen3.5-35B-A3B; teacher: Qwen3.5-35B-A3B-GRPO-dapomath17k-400step; `student_sampled` + adv mode, 8 GPU colocate |
 
 ### Multimodal OPD
 
@@ -80,7 +89,7 @@ SGLang per-position top-K log-prob transfer optimization (Qwen3-4B, simulated da
 
 ## Common Combinations
 
-Based on [`math_opd/run-opd-sampled-8xgpu-colocate.sh`](math_opd/run-opd-sampled-8xgpu-colocate.sh), modify key variables to switch modes:
+Based on [`math_opd/run-opd-qwen35-35B-A3B-8xgpu-colocate.sh`](math_opd/run-opd-qwen35-35B-A3B-8xgpu-colocate.sh), modify key variables to switch modes:
 
 > **KL type note**: `student_sampled` supports only `reverse_kl` and `low_var_kl`; `student_topk`, `teacher_topk`, and `union` support `reverse_kl`, `forward_kl`, and `jsd` (set via `--opd-kl-type`; `jsd` can be tuned with `--opd-jsd-alpha`).
 
@@ -130,8 +139,8 @@ OPD_KL_TYPE=reverse_kl
 **5. Multimodal union + loss + jsd**
 
 ```bash
-export RELAX_OPD_PREEXPANDED_PATCH=1     # required for multimodal
-export RELAX_OPD_PER_POS_TOKEN_IDS=1     # required for topk modes
+export SGLANG_MM_AVOID_RETOKENIZE=true  # native image processing
+export RELAX_OPD_PER_POS_TOKEN_IDS=1     # compact top-K transport
 OPD_KL_COEF=0.0
 OPD_LOSS_COEF=1.0
 OPD_TOKEN_SELECTION=union

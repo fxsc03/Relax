@@ -13,16 +13,16 @@ The DeepEyes example demonstrates **agentic multi-turn vision-language RL** usin
 
 ## Data Preparation
 
-DeepEyes uses the [Visual-Agent/DeepEyes](https://huggingface.co/datasets/Visual-Agent/DeepEyes) dataset from HuggingFace. The dataset contains visual QA samples with images stored inline (HF Image format).
+DeepEyes uses the [ChenShawn/DeepEyes-Datasets-47k](https://huggingface.co/datasets/ChenShawn/DeepEyes-Datasets-47k) dataset from HuggingFace. The dataset contains visual QA samples with images stored inline (HF Image format).
 
 ### Download the Dataset
 
 ```bash
-# 使用 huggingface-cli
+# Using the Hugging Face CLI
 hf download --repo-type dataset ChenShawn/DeepEyes-Datasets-47k \
   --local-dir /root/deepeyes-v1
 
-# 或使用 Python
+# Or use Python
 from datasets import load_dataset
 ds = load_dataset("ChenShawn/DeepEyes-Datasets-47k")
 ds.save_to_disk("/root/deepeyes-v1")

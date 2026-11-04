@@ -2,7 +2,7 @@
 
 Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖 PPO 与主要 GRPO-family 算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
 
-GRPO、RLOO、CISPO、GSPO 与 SAPO 使用相同的 Actor/Rollout 服务拓扑；其中 RLOO 仅支持同步模式，并要求固定批量不变量。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
+GRPO、Score Centering、RLOO、CISPO、GSPO、SAPO 与 M2PO 使用相同的 Actor/Rollout 服务拓扑；其中 RLOO 仅支持同步模式，并要求固定批量不变量。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
 REINFORCE++ 与 REINFORCE++-baseline 同样复用 GRPO 服务拓扑，但 return、全局归一化和 KL 契约由算法单独定义。启用任一 estimator 前，请先阅读 [REINFORCE++ 训练文档](../guide/reinforce-plus-plus.md)。
 
@@ -44,6 +44,76 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ---
 
+## Score Centering（SC）
+
+Score Centering 用于修正 rollout 分布与训练分布不一致时的策略梯度漂移，例如 sampler 使用了较低精度。这里的 score 指策略 log-probability 的梯度，不是 reward。SC 减去生成分布下的期望 score，并不会让训推 log-probability 完全相同。
+
+Relax 记录生成时的 top-K 候选 ID 和概率，在 trainer 中对相同候选评分，并近似未记录的尾部。默认 advantage 为每条 response 的 reward 减去 prompt 组内平均 reward，不除以组内标准差。与 RLOO 不同，这个均值包含当前 response。策略损失使用 score centering，而不是 PPO clipping。
+
+### 配置
+
+在已有的 text-only Megatron recipe 中，将算法参数替换为以下配置，并在训练命令中传入 `"${SC_ARGS[@]}"`：
+
+```bash
+SC_ARGS=(
+   --loss-type policy_loss
+   --advantage-estimator score_centering
+   --calculate-per-token-loss
+   --n-samples-per-prompt 8
+   --rollout-temperature 1.0
+   --rollout-top-p 1.0
+   --rollout-top-k -1
+   --rollout-top-logprobs-num 128
+   --score-centering-is none
+   --kl-coef 0
+)
+```
+
+保持 reward normalization 开启，移除原 recipe 中的 `--disable-rewards-normalization`、`--normalize-advantages`、OPD 和外层 TIS 配置。SC 要求每个 prompt 至少采样两条 response，并按全局有效 token 数归一化 loss。`--eps-clip` 和 `--eps-clip-high` 不控制这一损失。Reference-policy KL loss 与 entropy 正则仍可单独配置。
+
+| 参数 | 解析器默认值 | 说明 |
+|---|---|---|
+| `--rollout-top-logprobs-num` | `128` | 候选数量 K，范围为 1 到真实词表大小；增大会增加采集、传输与评分成本，不改变采样 top-k |
+| `--score-centering-is` | `none` | 内部 importance weighting：`none`、`tis` 或 `mis`，同时作用于 sampled 项和中心化修正项 |
+| `--score-centering-tis-clip` | `2.0` | TIS 权重上限，须为有限正数 |
+| `--score-centering-mis-low` | `0.5` | MIS 权重保留区间下界 |
+| `--score-centering-mis-high` | `5.0` | MIS 区间上界；上下界须满足 `0 < low <= high` |
+
+与 TIS 组合时，使用 `--score-centering-is tis --score-centering-tis-clip 2.0`，不要再启用 `--use-tis` 或 `--custom-tis-function-path`。SC 同样不接受 `--use-opsm`、`--use-unbiased-kl` 和自定义 policy-loss reducer。
+
+自定义 rollout 函数必须保留 sampled behavior log-probability，以及对齐的 `rollout_topk_token_ids` / `rollout_topk_log_probs`，并保留工具观测的 loss mask。返回概率必须反映实际采样温度和过滤条件。Top-p/min-p 过滤需要有限的 sampling top-k；`top_p < 1` 还要求 `--sglang-sampling-backend pytorch`。非 1 温度需要 `SGLANG_RETURN_ORIGINAL_LOGPROB=0`。当前采集路径不支持 speculative decoding、`sglang_rl_on_policy_target` 和 Ascend backend 的过滤采样。SC 使用 Megatron 文本 token policy loss，不适用于 FSDP diffusion 训练路径。
+
+### 诊断指标
+
+SC 在 `train/` 下记录按有效 token mask 统计的均值：
+
+- `sc_rollout_head_mass` / `sc_train_head_mass`：记录的候选在两侧分布中覆盖的概率质量。
+- `sc_tail_ratio` / `sc_tail_floor_fraction`：尾部质量之比，以及至少一侧尾部低于固定 `1e-6` 数值下限的位置比例。
+- `sc_correction`：带符号的中心化修正项标量，不能仅凭大小判断训练效果。
+- `sc_importance_weight`、`sc_is_clip_fraction`、`sc_zero_weight_fraction`：内部权重诊断。`--score-centering-is none` 时分别为 1、0、0。
+
+`--get-mismatch-metrics` 只增加 mismatch 诊断，不额外施加 TIS 权重。应结合验证 reward、生成长度、截断率和梯度范数判断训练状态；SC 有效并不要求 mismatch 趋近于零。
+
+### 快速开始
+
+使用八卡 [Qwen3-0.6B Countdown 脚本](../../../examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh)。先按[准备说明](../../../examples/algorithms/score-centering/EXPERIMENT.md)准备 BF16 模型、对应 FP8 权重和 Countdown JSONL 数据，并包含其中列出的 SGD 兼容及 BF16 导出修复。从仓库根目录向具有八张 GPU 的专用 Ray 集群提交：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/countdown-data \
+SAVE_DIR=/path/to/checkpoints \
+RAY_ADDRESS=http://ray-head:8265 \
+USE_SC=1 USE_TIS=0 \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh
+```
+
+`RAY_ADDRESS` 是 Ray Jobs HTTP 地址。`USE_SC=1 USE_TIS=0` 运行 SC；将 `USE_TIS` 改为 `1` 运行 SC 内部 TIS。`USE_SC=0` 使用原生 RLOO，同样通过 `USE_TIS` 控制是否开启原生 TIS。脚本默认 `USE_SC=0 USE_TIS=0`，选择实验时应显式设置两个开关。
+
+该配方使用 BF16 trainer、FP8 sampler、学习率 0.01 的 SGD，训练 400 步。这些是实验设置，SC 本身不要求 SGD。在线验证使用 FP8 sampler。每次独立运行应更换 `EXP_NAME`；当前 SGD 完整优化器恢复的限制见准备说明。
+
+---
+
 ## RLOO
 
 RLOO（REINFORCE Leave-One-Out）使用同一 prompt 的其他采样结果作为无偏基线。Relax 实现的是同步 RLOO，并采用不裁剪的 REINFORCE 策略损失，不使用 PPO ratio 或 clipping。
@@ -64,7 +134,7 @@ $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$
 
 $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
 
-这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
+这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。loss mask 只控制 token 是否参与策略损失，不会将该样本的 reward 排除出组内 baseline 计算。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
 
 ### 约束与参数
 
@@ -274,17 +344,86 @@ SAPO_ARGS=(
 
 ---
 
+## M2PO
+
+M2PO（Second-Moment Trust Policy Optimization）用有害 token 上重要性比对数的**二阶矩**作为信任域约束：仅当二阶矩超过预算时才收紧裁剪，否则保留 token。相比固定裁剪，它在 off-policy（陈旧数据）场景下能保留更多有效梯度、缓解熵坍缩，是专为数据复用 / 异步训练设计的算法。
+
+参考论文：[Prosperity before Collapse: How Far Can Off-Policy RL Reach with Reuse of Mini-Batch Data?](https://arxiv.org/abs/2510.01161)（NeurIPS 2025）。
+
+### 算法原理
+
+M2PO 只约束 PPO 会裁剪的"有害" token —— 即优势符号与 ratio 偏移方向一致、会造成过度更新的 token：
+
+$$\mathcal{H} = \{t : \hat{A}_t > 0,\ r_t > 1\} \cup \{t : \hat{A}_t < 0,\ r_t < 1\}$$
+
+其中 $r_t = \exp(-\text{KL}_t)$，$\text{KL}_t = \log\pi_{\theta_\text{old}}(o_t) - \log\pi_\theta(o_t)$。这些 token 上 log-ratio 的二阶矩为：
+
+$$M_2 = \frac{1}{|\mathcal{H}|} \sum_{t \in \mathcal{H}} (\log r_t)^2$$
+
+Relax 会在每个 Megatron microbatch 的本地 token 上独立求解该统计量。日志保留既有聚合方式：开启 `--calculate-per-token-loss` 时，`train/ppo_kl_m2_before` 与 `train/ppo_kl_m2_after` 按 microbatch 参与 loss 的 token 数加权；否则直接累加各 microbatch 的标量，再由框架除以 sample 数。后者不是按 sample 加权的均值，两种模式也都不是将整个 global batch 所有有害 token 合并计算的二阶矩。这些日志诊断值不会反馈到 loss。
+
+- 若 $M_2 \le$ `kl2_budget`：不裁剪，token 全部保留；
+- 否则用 water-filling 选择前一个已观测到的 breakpoint，得到保守的信任域半径 $\tau$；截顶后的总和不超过 $|\mathcal{H}| \cdot \text{kl2\_budget}$，并据此得到裁剪区间 $[e^{-\tau},\ e^{\tau}]$。
+
+最终裁剪边距为 $\varepsilon = \max(\text{自适应值},\ \text{miniclip})$，因此不会比配置的地板更紧；若希望以 GRPO 的边距为下限，应把地板设成相应值。`ppo_kl_m2_after` 是应用地板前、所选 breakpoint 对应的旧版求解器诊断值；在第一个 breakpoint 的边界情形下，它保留未截顶的局部均值。它并不是最终 policy clip 后重新计算的值。策略损失沿用 GRPO 一节的 PPO-Clip 悲观形式，仅裁剪边界改为自适应求解。
+
+### 关键参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `--advantage-estimator m2po` | — | — | 启用 M2PO |
+| `--m2po-kl2-budget` | `0.01` | `0.01`~`0.04` | 每个有害 token 的二阶矩预算。越小裁剪越紧/越频繁，越大越容忍 off-policy（论文用 `0.04`） |
+| `--m2po-miniclip-low` | `0.3` | `0.2` | 下侧裁剪边距地板（边距至少为 `miniclip_low`） |
+| `--m2po-miniclip-high` | `0.5` | `0.28` | 上方裁剪边距地板 |
+| `--use-rollout-logprobs` | 关闭 | 陈旧异步数据时开启 | 使用实际生成 token 的 behavior-policy log probabilities 作为 M2PO old policy |
+| `--use-tis` | 关闭 | 使用 rollout log probs 时关闭 | TIS 是 policy loss 之后的修正，不会驱动 M2PO 自适应阈值；它与 `--use-rollout-logprobs` 互斥 |
+
+> M2PO 自适应推导裁剪边界，因此**不使用** `--eps-clip` / `--eps-clip-high`。
+
+::: warning 既有实现行为
+注册表重构保留 M2PO 的既有计算方式：reward 处理直接传递原始样本奖励，阈值求解器不按 loss mask 过滤 token，也不跨 CP rank 汇总统计量；breakpoint 比较仍使用 host 标量。完成注册不代表与论文等价。由于裁剪统计量在本地计算，M2PO 声明 `supports_context_parallel=False`，启动时要求 `--context-parallel-size 1`，并关闭动态 context parallel。该校验保持算法的 reward、求解器和指标计算不变。
+:::
+
+### 推荐使用场景
+
+M2PO 的收益随训练数据的 off-policy 程度增大而放大，因此在以下场景**优先**考虑开启：
+
+- **较大 staleness 的异步训练**：fully-async 模式下 rollout 权重明显滞后于 actor（`--max-staleness` 取 32、256 甚至更高），陈旧样本会推高重要性比。固定裁剪此时要么把大量 token 直接置零、丢失梯度，要么放行造成过度更新；M2PO 用二阶矩自适应地只收紧真正"有害"的那部分，在保留学习信号的同时抑制崩溃。
+- **mini-batch 数据复用 / 多轮采样**：同一批 rollout 被反复用于多步更新时，后几步实际上也在 off-policy 数据上训练，M2PO 能延长这批数据的可用寿命。
+- **训练后期熵坍缩、reward 停滞**：当固定裁剪导致策略过快收窄、探索不足时，M2PO 更宽松的自适应边界有助于维持熵、延缓坍缩。
+
+反过来，若是严格 on-policy（`--max-staleness 0`、每步同步权重）的同步训练，M2PO 相对 GRPO 的增量有限，可先用 GRPO 作为基线。
+
+M2PO 在 true-on-policy 模式下仍是合法的，但此时重要性比恒为 1，自适应裁剪不会触发。要评估陈旧数据下的效果，请确保运行能提供 old-policy log probabilities，而不是自动开启 `--true-on-policy-mode`。对于 fully-async rollout staleness，应传入 `--use-rollout-logprobs`；`--use-tis` 只会在 M2PO 已经选完裁剪边界之后生效。
+
+### 快速开始
+
+使用任意 GRPO 训练脚本，将 `GRPO_ARGS` 替换为 `M2PO_ARGS`：
+
+```bash
+M2PO_ARGS=(
+   --advantage-estimator m2po
+   --m2po-kl2-budget 0.01
+   --m2po-miniclip-low 0.2
+   --m2po-miniclip-high 0.28
+)
+```
+
+---
+
 ## 算法对比
 
 | 算法 | Advantage 计算 | 策略损失 | KL 约束方式 |
 |------|---------------|---------|-----------|
 | **PPO** | Critic value + GAE | PPO-Clip（硬裁剪） | 当前同步拓扑中禁用 |
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
+| **Score Centering** | 组内减均值，不除组标准差 | 中心化 score，可选内部 TIS/MIS | reward-side KL 禁用；可选直接 KL loss |
 | **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
 | **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
+| **M2PO** | 原始样本奖励广播到 token | 二阶矩自适应裁剪 | 可选 KL loss（大 staleness / off-policy 场景优先） |
 | **RLOO** | Leave-one-out 基线 | 非裁剪 REINFORCE | 可选 KL loss（同 GRPO） |
 
 ## 下一步

@@ -4,9 +4,11 @@
 import argparse
 import inspect
 import json
+import logging
 import os
 import pickle
 import re
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Literal
 
@@ -19,20 +21,80 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from relax.utils.device import is_npu_available
+from relax.utils.device import is_npu_available, make_current_torch_device
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
-from relax.utils.misc import load_function
-from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
+from relax.utils.megatron_peft_utils import (
+    _lora_module_key,
+    build_lora_peft,
+    count_adapter_parameters,
+    exclude_frozen_lora_target_modules,
+    inherit_lora_tp_grad_sync,
+    install_gdn_gate_mask_hooks,
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+    scope_target_modules_to_region,
+    summarize_lora_modules,
+)
+from relax.utils.misc import load_function, resolve_is_vl_model
+from relax.utils.training.ppo_utils import (
+    ensure_sequence_classification_head_trainable,
+    install_critic_value_head_in_provider,
+    install_reward_model_head_in_provider,
+    install_sequence_classification_head_in_provider,
+)
 
+from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
 
 
 logger = get_logger(__name__)
+
+
+def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
+    """Preserve GDN A_log precision before Float16Module, DDP and HF
+    loading."""
+    for module in model.modules():
+        if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
+            continue
+        # Import only for GDN models; other architectures need no GDN dependencies.
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.transformer.module import mark_keep_in_fp32
+
+        if isinstance(module, GatedDeltaNet):
+            # Keep Parameter identity and TP metadata. This also preserves the
+            # constructor's RNG sequence and works for meta-device construction.
+            module.A_log.data = module.A_log.data.float()
+            mark_keep_in_fp32(module.A_log)
+
+
+def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    """Propagate MTP detach-path settings to every Megatron model config."""
+    detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    detach_all_paths = {"embedding", "backbone", "lm-head"}.issubset(detach_paths)
+    seen_configs: set[int] = set()
+    for module in model.modules():
+        config = getattr(module, "config", None)
+        if config is not None and id(config) not in seen_configs:
+            setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
+            setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
+            setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+            setattr(config, "mtp_detach_heads", detach_all_paths)
+            seen_configs.add(id(config))
+
+        if isinstance(module, MultiTokenPredictionBlock):
+            for param in module.parameters():
+                if detach_all_paths:
+                    param.grad_norm_group = "mtp"
+                elif getattr(param, "grad_norm_group", None) == "mtp":
+                    del param.grad_norm_group
 
 
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
@@ -85,6 +147,41 @@ def _dump_provider_config(provider: Any, save_path: str) -> None:
 _CP_PROBE_INSTALLED = False
 
 
+def _patch_bridge_vision_cp_all_gather(bridge_model_module: Any, all_gather_vision_embeddings: Any) -> bool:
+    """Make Bridge's Qwen3-VL CP vision all-gather accept keyword arguments.
+
+    The Bridge Qwen3-VL forward currently calls ``autograd.Function.apply``
+    with ``cp_group=...``.  PyTorch only accepts positional arguments for
+    ``apply``, so the vision CP path fails before the first forward.  Keep the
+    autograd function unchanged and adapt only its call surface in the Bridge
+    model module.
+    """
+    if getattr(bridge_model_module, "AllGatherVisionEmbeddings", None) is not all_gather_vision_embeddings:
+        return False
+
+    class _AllGatherVisionEmbeddingsCompat:
+        @staticmethod
+        def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            return all_gather_vision_embeddings.apply(input, seqlens_on_cp_ranks, cp_group)
+
+    bridge_model_module.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsCompat
+    return True
+
+
+def _install_bridge_vision_cp_all_gather_compat() -> None:
+    """Install the Qwen3-VL Bridge compatibility patch when that model is
+    present."""
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import model as bridge_qwen3_vl_model
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import AllGatherVisionEmbeddings
+    except ImportError:
+        return
+
+    if _patch_bridge_vision_cp_all_gather(bridge_qwen3_vl_model, AllGatherVisionEmbeddings):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Patched Bridge Qwen3-VL vision CP all-gather for PyTorch autograd.apply compatibility.")
+
+
 def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module) -> None:
     """Mark `args.uses_unsplit_forward` when the bridge produces a model whose
     forward expects UNSPLIT input + global cu_seqlens + attention_mask and does
@@ -95,6 +192,9 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
+    if getattr(model, "uses_unsplit_forward", False):
+        args.uses_unsplit_forward = True
+        return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
@@ -178,37 +278,81 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
     )
 
 
+def _call_model_provider(provider: Any, *args: Any, **kwargs: Any) -> GPTModel:
+    """Forward current MCore arguments while supporting older/custom
+    providers."""
+    parameters = inspect.signature(provider).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+            and parameters[key].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+    return provider(*args, **kwargs)
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from relax.models.qwen3_5.recipe import enabled as optimized_recipe
+
+    args._relax_qwen35_optimized = optimized_recipe(args)
+    if args._relax_qwen35_optimized:
+        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
+        from relax.models.qwen3_5.deepep_backend import ensure_backend
+
+        ensure_backend(args)
+
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
         def wrapped_model_provider(
-            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None
+            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None, **kwargs: Any
         ) -> GPTModel:
             custom_model_provider = load_function(args.custom_model_provider_path)
-            # Check if the custom provider supports vp_stage parameter
-            has_vp_stage = "vp_stage" in inspect.signature(custom_model_provider).parameters
-            if has_vp_stage:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-            else:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            model = _call_model_provider(
+                custom_model_provider,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=vp_stage,
+                **kwargs,
+            )
+            for module in model.modules():
+                if getattr(module, "config", None) is not None:
+                    _validate_linear_cp_mode(args, module.config)
+            configure_gdn_a_log_fp32(model)
+            configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_reward_model_head_in_provider(model, args, role, post_process)
+
+            install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
 
+        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+            wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
+        is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+        if is_kimi_k3:
+            from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
@@ -216,34 +360,65 @@ def get_model_provider_func(
             "sequence_parallel",
             "pipeline_model_parallel_size",
             "virtual_pipeline_model_parallel_size",
+            # Let a launch script pass an explicit --pipeline-model-parallel-layout
+            # (mcore-native, str form "Ett|tt|..|ttL").
+            # Must NOT be combined with --decoder-first/last-pipeline-num-layers
+            # (mcore raises "pipeline_model_parallel_layout cannot be set with other pipeline
+            # layout arguments"); drop those flags in the script when using a layout.
+            "pipeline_model_parallel_layout",
             "context_parallel_size",
+            "cp_comm_type",
+            "cp_partition_mode",
+            "sequence_packing_scheduler",
+            "max_seqlen_per_dp_cp_rank",
+            "pad_packed_seq_alignment",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
             "dsa_indexer_loss_coeff",
+            "qsa_indexer_loss_coeff",
+            "qsa_force_sparse",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            # Bridge mode bypasses core_transformer_config_from_args(), so FP8
+            # compute flags must be copied onto the provider explicitly.
+            "fp8",
+            "fp8_recipe",
+            "fp8_quantizer_factory",
             "masked_softmax_fusion",
             "bias_dropout_fusion",
             "apply_rope_fusion",
             "recompute_granularity",
             "recompute_method",
             "recompute_num_layers",
+            "recompute_modules",
             "distribute_saved_activations",
+            "fine_grained_activation_offloading",
+            "offload_modules",
+            "min_offloaded_tensor_size",
+            "activation_offload_fraction",
+            "delta_offload_bytes_across_pp_ranks",
+            "delay_offload_until_cuda_graph",
+            "fine_grained_offloading_max_inflight_offloads",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
+            "moe_router_fusion",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
+            "moe_flex_dispatcher_num_sms",
+            "moe_hybridep_pad_variable_tokens",
             "use_audio_in_video",
             "freeze_language_model",
             "freeze_vision_model",
             "freeze_vision_projection",
             "freeze_audio_model",
             "freeze_audio_projection",
-            # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
+            # https://github.com/redai-studio/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
@@ -251,6 +426,11 @@ def get_model_provider_func(
             "cross_entropy_fusion_impl",
             "mtp_num_layers",
             "mtp_loss_scaling_factor",
+            # Reuse one physical MTP layer across all mtp_num_layers depths. Must
+            # be copied onto the bridge provider or it stays at the default (False)
+            # even when --mtp-use-repeated-layer is passed, so the model builds N
+            # physical layers (layers.1/2 unloaded/random).
+            "mtp_use_repeated_layer",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
@@ -267,6 +447,7 @@ def get_model_provider_func(
             "rotary_base",
             "moe_router_pre_softmax",
             "moe_router_enable_expert_bias",
+            "moe_router_bias_update_rate",
             "moe_permute_fusion",
             "moe_grouped_gemm",
             "moe_shared_expert_intermediate_size",
@@ -276,22 +457,56 @@ def get_model_provider_func(
             "moe_router_topk_scaling_factor",
             "moe_router_score_function",
             "moe_ffn_hidden_size",
+            "activation_func_clamp_shared_expert",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Dynamic CP related args
             "dynamic_context_parallel",
+            "linear_cp_mode",
+            "gdn_pre_gated_delta_rule_fusion",
+            "gdn_conv_pad_alignment",
         ]
 
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
+                if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
+                    continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
+                    new_val = new_val[0]
                 if getattr(args, "dynamic_context_parallel", False):
                     if attr == "dynamic_context_parallel":
                         new_val = False
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if callable(getattr(provider, "configure_runtime", None)):
+            provider.configure_runtime(args)
+
+        if is_kimi_k3:
+            configure_runtime(provider, args)
+            # Fake-QAT aligns the training forward with the MXFP4 grid the
+            # rollout engine serves; gated by OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG.
+            from relax.backends.megatron.fake_qat_mxfp4 import maybe_install_mxfp4_fake_qat
+
+            maybe_install_mxfp4_fake_qat()
+
+        # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
+        # the vision encoder input before its CP all-gather.  Relax's public
+        # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
+        # Without this compatibility mapping the parsed flag is silently
+        # ignored, so every CP rank repeats the full vision forward.
+        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+            if not provider.vision_dp_when_cp:
+                logger.info(
+                    "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
+                )
+            provider.vision_dp_when_cp = True
+
+        if getattr(provider, "vision_dp_when_cp", False):
+            _install_bridge_vision_cp_all_gather_compat()
 
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
@@ -314,6 +529,65 @@ def get_model_provider_func(
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
 
+        # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
+        # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge
+        # auto-installs one in apply_overrides_and_finalize(), which we bypass.
+        if (
+            getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid"
+            and (getattr(provider, "pipeline_model_parallel_size", 1) or 1) > 1
+            and getattr(provider, "pipeline_model_parallel_layout", None) is None
+        ):
+            from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
+                set_deepseek_v4_pipeline_model_parallel_layout,
+            )
+
+            set_deepseek_v4_pipeline_model_parallel_layout(provider)
+            logger.info(f"Set provider.pipeline_model_parallel_layout: {provider.pipeline_model_parallel_layout}")
+
+            # mcore rejects a layout that coexists with num_layers_in_first/last_pipeline_stage
+            # ("pipeline_model_parallel_layout cannot be set with other pipeline layout
+            # arguments"), but Megatron's own validate_args only skips its
+            # "num_layers % pipeline_model_parallel_size == 0" check when
+            # --decoder-first/last-pipeline-num-layers is set -- and DSv4-Flash has 43
+            # layers, a prime, so no PP > 1 divides it. Those flags therefore exist purely
+            # to get past arg validation; the layout already encodes the real split, so
+            # drop their provider-side effect here (lines 311-314 above set them).
+            if (
+                provider.num_layers_in_first_pipeline_stage is not None
+                or provider.num_layers_in_last_pipeline_stage is not None
+            ):
+                logger.info(
+                    "Clearing provider.num_layers_in_first/last_pipeline_stage "
+                    f"({provider.num_layers_in_first_pipeline_stage}/"
+                    f"{provider.num_layers_in_last_pipeline_stage}); superseded by the DSv4 layout."
+                )
+                provider.num_layers_in_first_pipeline_stage = None
+                provider.num_layers_in_last_pipeline_stage = None
+
+        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
+        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
+        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
+        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
+        # radius structural rather than an argument about current mcore internals.
+        #
+        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
+        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
+        # unless the user opts out -- while the TransformerConfig field defaults to False
+        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
+        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
+        # unfused reference path whose gather backward is quadratic in sequence length
+        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
+        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
+            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
+                logger.info(
+                    "Override provider.apply_dsa_kernel_fusion: "
+                    f"{provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
+                )
+                provider.apply_dsa_kernel_fusion = want_fusion
+
+        _validate_linear_cp_mode(args, provider)
         provider.finalize()
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
@@ -324,9 +598,27 @@ def get_model_provider_func(
         original_provide = provider.provide
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
-            model = original_provide(*p_args, **p_kwargs)
+            # Bridge providers are their own TransformerConfig. MCore's config
+            # argument belongs to the raw/custom path; its process groups must
+            # still reach Bridge's GPTModel constructor.
+            p_kwargs.pop("config", None)
+            pg_collection = p_kwargs.pop("pg_collection", None)
+            if pg_collection is not None:
+                provider._pg_collection = pg_collection
+            model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            configure_gdn_a_log_fp32(model)
+            configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+
+            install_sequence_classification_head_in_provider(
+                model,
+                args,
+                role,
+                post_process,
+                stash_lm_head=True,
+            )
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -337,7 +629,13 @@ def get_model_provider_func(
 
         return provide_with_cp_probe
 
-    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
+    def model_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: TransformerConfig | None = None,
+        pg_collection: Any = None,
+    ) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -353,7 +651,9 @@ def get_model_provider_func(
         use_te = args.transformer_impl == "transformer_engine"
 
         # Experimental loading arguments from yaml
-        config: TransformerConfig = core_transformer_config_from_args(args)
+        if config is None:
+            config = core_transformer_config_from_args(args)
+        _validate_linear_cp_mode(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -423,6 +723,8 @@ def get_model_provider_func(
 
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
 
         if args.mtp_num_layers:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
@@ -439,7 +741,12 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_gdn_a_log_fp32(model)
+        configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_reward_model_head_in_provider(model, args, role, post_process)
+
+        install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
@@ -452,6 +759,31 @@ def get_model_provider_func(
     return model_provider
 
 
+def _global_vision_lora_count(local_count: int, args) -> int:
+    """Max vision-region LoRA module count across all ranks (adapter mode
+    only).
+
+    The vision tower lives on a single PP stage, so only some ranks can observe it.
+    A rank-local check would raise on those ranks while the rest marched on into the
+    next collective and hung, so the count is all-reduced first and every rank then
+    reaches the same verdict.
+
+    Gated on adapter mode, which is uniform across ranks — no rank can skip the
+    collective while another enters it. Returns ``local_count`` unchanged when
+    ``torch.distributed`` is not initialized (single-process tests).
+    """
+    if not is_lora_adapter_mode(args):
+        return 0
+    if not dist.is_initialized():
+        return local_count
+    group = dist.group.WORLD
+    # NCCL/HCCL cannot reduce a CPU tensor; gloo cannot reduce an accelerator one.
+    on_cpu = dist.get_backend(group) == "gloo"
+    count = torch.tensor([local_count], dtype=torch.int32, device="cpu" if on_cpu else make_current_torch_device())
+    dist.all_reduce(count, op=dist.ReduceOp.MAX, group=group)
+    return int(count.item())
+
+
 def wrap_model_provider_with_lora(original_provider, args):
     """Wrap model provider to add LoRA support.
 
@@ -462,32 +794,71 @@ def wrap_model_provider_with_lora(original_provider, args):
         return original_provider
 
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         try:
             peft = build_lora_peft(args)
+            # Restrict adapter injection to the requested model region (e.g. language-only
+            # for VL models). Overriding target_modules post-construction is supported:
+            # PEFT.__call__ rebuilds its matcher state from the current target_modules.
+            scope = getattr(args, "lora_scope", "all")
+            if scope != "all":
+                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+                peft.target_modules = exclude_frozen_lora_target_modules(
+                    model, list(peft.target_modules), args.freeze_params_name_list
+                )
             model = peft(model, training=True)
+            inherit_lora_tp_grad_sync(model)
+            ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
+            gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
+            adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]
+            by_role = summarize_lora_modules(adapter_names)
+            vision_wrapped = _global_vision_lora_count(by_role.get("vision", 0), args)
             if dist.is_initialized() and dist.get_rank() == 0:
                 adapter_params, total_params, percentage = count_adapter_parameters(model)
+                mode = "adapter" if is_lora_adapter_mode(args) else ("merge" if is_lora_merge_mode(args) else "plain")
                 logger.info(
-                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                    "LoRA enabled: mode=%s scope=%s rank=%d alpha=%d dropout=%s targets=%s | "
+                    "wrapped modules by role (rank0-local): %s | adapter_params=%s (%.2f%% of %s total)",
+                    mode,
+                    scope,
+                    args.lora_rank,
+                    args.lora_alpha,
+                    args.lora_dropout,
+                    list(args.lora_target_modules),
+                    by_role,
+                    f"{adapter_params:,}",
+                    percentage,
+                    f"{total_params:,}",
+                )
+                if gdn_gate_masked:
+                    logger.info(
+                        "LoRA: pinned the GDN in_proj adapter's b/a (gate) rows to zero on %d "
+                        "module(s); SGLang hosts the delta on the fused in_proj_qkvz slices only.",
+                        gdn_gate_masked,
+                    )
+                if logger.isEnabledFor(logging.DEBUG):
+                    for module_name in sorted({_lora_module_key(n) for n in adapter_names}):
+                        logger.debug("LoRA wrapped module: %s", module_name)
+            if vision_wrapped:
+                raise ValueError(
+                    f"LoRA adapter mode wrapped {vision_wrapped} vision-region module(s) (scope={scope}). "
+                    "SGLang hosts LoRA on language-model layers only, so this adapter would be trained "
+                    "but silently dropped before rollout, breaking the on-policy assumption. Pass "
+                    "--lora-scope language, or use --lora-merge-mode (which folds the vision adapter "
+                    "into the synced base weights)."
                 )
         except RuntimeError:
             # build_lora_peft already raises a clear upgrade-hint message when the
             # Megatron-Bridge image lacks PEFT support; don't shadow it.
             raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
-            ) from e
 
         return model
 
@@ -499,16 +870,16 @@ def wrap_model_provider_with_freeze(original_provider, args):
         if vp_stage is None and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
             vp_stage = mpu.get_virtual_pipeline_model_parallel_rank()
 
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
+        ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model
 
@@ -530,3 +901,41 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+
+def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
+    """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    trainable = [
+        (name, param) for model_chunk in model for name, param in model_chunk.named_parameters() if param.requires_grad
+    ]
+    unexpected = [name for name, _ in trainable if re.search(r"(^|\.)mtp(\.|$)", name) is None]
+    local_param_count = len(trainable)
+    global_param_count = local_param_count
+    global_unexpected_count = len(unexpected)
+    if dist.is_available() and dist.is_initialized():
+        first_param = next(param for model_chunk in model for param in model_chunk.parameters())
+        counts = torch.tensor(
+            [local_param_count, len(unexpected)],
+            dtype=torch.long,
+            device=first_param.device,
+        )
+        dist.all_reduce(counts, group=dist.group.WORLD)
+        global_param_count, global_unexpected_count = (int(value) for value in counts.tolist())
+
+    if global_unexpected_count:
+        details = ", ".join(unexpected[:10]) if unexpected else "reported by another distributed rank"
+        raise RuntimeError(f"--mtp-only-training left non-MTP parameters trainable: {details}")
+
+    if global_param_count == 0:
+        raise RuntimeError("--mtp-only-training found no trainable MTP parameters in the distributed model.")
+
+    local_numel = sum(param.numel() for _, param in trainable)
+    logger.info(
+        "MTP-only trainable parameters on this rank: tensors=%d, elements=%d; distributed tensors=%d",
+        local_param_count,
+        local_numel,
+        global_param_count,
+    )

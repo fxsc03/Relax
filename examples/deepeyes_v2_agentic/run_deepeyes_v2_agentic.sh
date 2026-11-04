@@ -13,7 +13,9 @@ TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
+set +x
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+set -x
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
@@ -55,6 +57,12 @@ export APPTAINER_IMAGE_PATH="${APPTAINER_IMAGE_PATH:-${DATA_DIR}/sif/deepeyes_v2
 if [ ! -f "${APPTAINER_IMAGE_PATH}" ]; then
     echo "ERROR: SIF not found at ${APPTAINER_IMAGE_PATH}."
     echo "Run: DATA_DIR=${DATA_DIR} bash ${SCRIPT_DIR}/scripts/prepare.sh"
+    exit 1
+fi
+DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
+if [ ! -x "${DEEPEYES_V2_APP_PYTHON}" ]; then
+    echo "ERROR: DeepEyes V2 app environment not found at ${DEEPEYES_V2_APP_PYTHON}."
+    echo "Run: bash ${SCRIPT_DIR}/scripts/prepare_app_env.sh"
     exit 1
 fi
 
@@ -102,6 +110,8 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 # agent process can find apptainer / search cache.
 # SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
 # to find the apptainer backend YAML config (image path, bind paths, etc).
+# Runtime configuration may include credentials.
+set +x
 RUNTIME_ENV_JSON=$(cat <<EOF
 {
   "env_vars": {
@@ -111,11 +121,13 @@ RUNTIME_ENV_JSON=$(cat <<EOF
     "DEEPEYES_JUDGE_BASE_URL": "${DEEPEYES_JUDGE_BASE_URL:-}",
     "DEEPEYES_JUDGE_MODELS": "${DEEPEYES_JUDGE_MODELS:-}",
     "DEEPEYES_JUDGE_API_KEY": "${DEEPEYES_JUDGE_API_KEY:-}",
-    "APPTAINER_IMAGE_PATH": "${APPTAINER_IMAGE_PATH:-}"
+    "APPTAINER_IMAGE_PATH": "${APPTAINER_IMAGE_PATH:-}",
+    "DEEPEYES_V2_APP_PYTHON": "${DEEPEYES_V2_APP_PYTHON}"
   }
 }
 EOF
 )
+set -x
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -133,10 +145,6 @@ ROLLOUT_ARGS=(
     # sessions are both kept, which is what makes hang/timeout diagnosis
     # possible — Relax's own tmpdir-based capture drops both.
     --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
-    # 30-min default is too generous: normal sessions take 1-3 min, a
-    # zombie session still burning chat completions after 10 min is
-    # ~always doomed. Faster session-level SIGKILL clears prepare-gate
-    # IR backlog quicker so new groups actually get served.
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
     --micro-batch-size 1
@@ -148,7 +156,6 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --rollout-shuffle
     --use-streaming-dataset
-    --agentic-prepare-pool-size 0
 )
 
 ###############################################################################
@@ -162,7 +169,7 @@ EVAL_ARGS=(
     --n-samples-per-eval-prompt 8
     --eval-max-response-len 4096
     --eval-top-p 0.7
-    --agentic-eval-prepare-pool-size 32
+    --agentic-eval-concurrency ${AGENTIC_EVAL_CONCURRENCY:-128}
 )
 
 ###############################################################################
@@ -259,6 +266,21 @@ RAY_RESOURCE_ARGS=(
 
 mkdir -p logs
 
+# Pass search configuration to Ray workers without tracing credentials.
+set +x
+export RUNTIME_ENV_JSON
+RUNTIME_ENV_JSON=$(python3 - <<'PYTHON'
+import json
+import os
+
+payload = json.loads(os.environ["RUNTIME_ENV_JSON"])
+for name in ("DEEPEYES_V2_SEARCH_CONFIG", "DEEPEYES_V2_SEARCH_API_KEY"):
+    value = os.environ.get(name)
+    if value:
+        payload["env_vars"][name] = value
+print(json.dumps(payload))
+PYTHON
+)
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
     -- python3 relax/entrypoints/train.py \
@@ -273,3 +295,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MEGATRON_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     2>&1 | tee logs/${EXP_NAME}.log
+set -x

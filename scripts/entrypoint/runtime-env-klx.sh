@@ -45,6 +45,8 @@ export RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
+    \"CUDA_FAKE_UVA_H2D_FIXUP_MAXBYTES\": \"${CUDA_FAKE_UVA_H2D_FIXUP_MAXBYTES:-65535}\",
+    \"CUDA_FAKE_UVA_H2D_FIXUP_SCANBYTES\": \"${CUDA_FAKE_UVA_H2D_FIXUP_SCANBYTES:-65535}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
     \"OMP_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
@@ -130,6 +132,7 @@ export RUNTIME_ENV_JSON="{
     \"XSGL_TRANSPOSE_CONV_STATE\": \"1\",
     \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"1\",
     \"XSGL_MOE_UNSTABLE_TOPK\": \"${XSGL_MOE_UNSTABLE_TOPK:-1}\",
+    \"XSGL_QUANT_ALL_GATHER\": \"${XSGL_QUANT_ALL_GATHER:-0}\",
     \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
     \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
     \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",

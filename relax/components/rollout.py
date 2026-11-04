@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,6 +19,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()
@@ -81,6 +81,9 @@ class ScaleOutStatusResponse(BaseModel):
     updated_at: float
     error_message: Optional[str]
     weight_version: Optional[str]
+    # Must be declared or FastAPI's response_model strips it from every scale-out
+    # HTTP surface (and the autoscaler poll-back that reads it).
+    failure_categories: List[str] = Field(default_factory=list)
 
 
 class EnginesInfoResponse(BaseModel):
@@ -333,8 +336,10 @@ class Rollout(Base):
         self.config = config
         self.healthy = healthy
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role="rollout",
+        )
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
@@ -398,11 +403,11 @@ class Rollout(Base):
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
 
     async def _async_run(self) -> None:
-        from relax.engine.sft.runtime import is_sft_mode
+        from relax.engine.sft.runtime import is_offline_mode
 
-        # SFT-with-rollout: Rollout is a passive SGLang server that responds to
-        # HTTP /predict and /evaluate driven by the Actor. No RL rollout loop.
-        if is_sft_mode(self.config):
+        # Offline training has no RL rollout loop. SFT can use a passive SGLang
+        # server for HTTP /predict and /evaluate driven by the Actor.
+        if is_offline_mode(self.config):
             return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
@@ -588,16 +593,30 @@ class Rollout(Base):
         can_update = await self._async_check_production_for_update_weight(step)
         if can_update:
             self._weight_update_ready.clear()
+            self.status = "paused"
             try:
-                self.status = "paused"
+                prepared = await self.rollout_manager.set_weight_updating.remote(True)
+                if prepared is False:
+                    raise HTTPException(status_code=503, detail="Elastic scale-in is draining")
                 await self.rollout_manager.health_monitoring_pause.remote()
-                await self.rollout_manager.set_weight_updating.remote(True)
+            except Exception:
+                rollback_succeeded = False
+                try:
+                    await self.rollout_manager.set_weight_updating.remote(False)
+                    rollback_succeeded = True
+                except Exception as rollback_error:
+                    self._logger.warning(
+                        "Failed to roll back a partial weight-update handshake: %s",
+                        rollback_error,
+                    )
+                if rollback_succeeded:
+                    self.status = "running"
+                raise
             finally:
-                # Always release the handshake gate: even if the remote calls
-                # above raise (e.g. RayActorError from a dead engine),
-                # end_update_weight must not block forever. The 500 still
-                # propagates to the actor, which already has graceful
-                # degradation (actor_fwd_only). _weight_update_ready only orders
+                # Always release the handshake gate if a remote call above
+                # raises, so a later end_update_weight cannot block forever.
+                # The error still propagates to the actor, which fails closed.
+                # _weight_update_ready only orders
                 # the can_do <-> end_update_weight handshake; it does not gate
                 # the real weight transfer, so setting it on the failure path
                 # cannot make an engine use wrong weights.

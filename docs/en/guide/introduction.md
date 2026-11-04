@@ -2,7 +2,7 @@
 
 ## What is Relax?
 
-**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-infra/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
+**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-studio/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
 
 ---
 
@@ -26,7 +26,7 @@ Relax adopts a service-oriented six-layer architecture where all components are 
 
 ### ⚡ Fully Asynchronous Training via TransferQueue
 
-Open source at [TransferQueue](https://github.com/redai-infra/TransferQueue). See [Fully Asynchronous Training](./fully-async-training.md) for details.
+Open source at [TransferQueue](https://github.com/redai-studio/TransferQueue). See [Fully Asynchronous Training](./fully-async-training.md) for details.
 
 In fully async mode, five roles—Rollout (inference), Actor (training), ActorFwd (forward pass), Reference (reference model), and Advantages (advantage computation)—run on **independent GPU clusters** and exchange data via TransferQueue, with weights synchronized asynchronously through DCS (Distributed Checkpoint Service).
 
@@ -58,6 +58,28 @@ Unlike traditional VLM single-turn QA, **Agentic VLM** achieves closed-loop iter
 - **VLM multimodal context maintenance**: In visual multi-turn interactions, each observation may carry new images/videos. Relax simultaneously maintains `image_data` on the Rollout side (incrementally appending encoded images per turn) and `multimodal_train_inputs` on the training side (incrementally merging processor-generated tensors per turn), enabling correct concatenation of multi-turn multimodal data
 - **Flexible termination conditions**: Supports combinations of three termination mechanisms: `max_turns` (maximum interaction turns), token budget (truncate when available token budget is exhausted), and `env done` (environment signals task completion)
 - **Typical Application**: DeepEyes task—Agentic Multi-Turn GRPO Training using Qwen3-VL-30B-A3B
+
+## Model Configurations and Examples
+
+The following models have configurations or integration code in this repository. Training modes and constraints are described by the linked scripts and guides; model configurations are collected in [`scripts/models/`](../../../scripts/models/).
+
+| Model | Scope | Configuration / guide |
+|---|---|---|
+| Qwen2.5 | Text | [7B](../../../scripts/models/qwen25-7B.sh) |
+| Qwen3 | Text | [0.6B](../../../scripts/models/qwen3-0.6B.sh), [1.7B](../../../scripts/models/qwen3-1.7B.sh), [4B](../../../scripts/models/qwen3-4B.sh), [8B](../../../scripts/models/qwen3-8B.sh), [32B](../../../scripts/models/qwen3-32B.sh), [30B-A3B](../../../scripts/models/qwen3-30B-A3B.sh) |
+| GLM4.7 | Text | [30B-A3B](../../../scripts/models/glm4.7-30B-A3B.sh) |
+| GLM5 | Text | [744B-A40B](../../../scripts/models/glm5-744B-A40B.sh) |
+| DeepSeek-V4-Flash | Text | [Flash](../../../scripts/models/deepseek-v4-flash.sh) |
+| Gemma4 | Text recipes | [26B-A4B](../../../scripts/models/gemma4-26B.sh), [31B](../../../scripts/models/gemma4-31B.sh) |
+| Qwen3-VL | Vision + language | [2B](../../../scripts/models/qwen3-vl-2B.sh), [4B](../../../scripts/models/qwen3-vl-4B.sh), [8B](../../../scripts/models/qwen3-vl-8B.sh), [30B-A3B](../../../scripts/models/qwen3-vl-30B-A3B.sh) |
+| Qwen3.5 | Vision + language | [4B](../../../scripts/models/qwen35-4B.sh), [9B](../../../scripts/models/qwen35-9B.sh), [27B](../../../scripts/models/qwen35-27B.sh), [35B-A3B](../../../scripts/models/qwen35-35B-A3B.sh), [122B-A10B](../../../scripts/models/qwen35-122B-A10B.sh), [397B-A17B](../../../scripts/models/qwen35-397B-A17B.sh) |
+| Qwen3.6 | Vision + language | [27B](../../../scripts/models/qwen36-27B.sh), [35B-A3B](../../../scripts/models/qwen36-35B-A3B.sh) |
+| Qwen3.8 | Vision + language | [27B](../../../scripts/models/qwen38-27B.sh) |
+| Kimi K2.6 | Vision + language | [K2.6](../../../scripts/models/kimi-k2.6.sh) |
+| Kimi K3 | Multimodal full-parameter / LoRA SFT and export | [K3](../../../scripts/models/kimi-k3.sh) · [Training and export guide](../../../examples/models/kimi-k3/README.md) |
+| dots.mocr | OCR / document understanding | [3B](../../../scripts/models/dotsocr2.sh) |
+| Qwen3-Omni | Text + vision + audio | [30B-A3B](../../../scripts/models/qwen3-omni-30B-A3B.sh) |
+| Qwen-Image | Text-to-image diffusion RL | [Training guide](./diffusion-generative-rl.md) |
 
 ## Project Structure
 

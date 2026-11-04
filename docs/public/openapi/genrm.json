@@ -9,7 +9,7 @@
     "/generate": {
       "post": {
         "summary": "Generate",
-        "description": "Generate response for given chat messages.\n\nTakes OpenAI-style messages as input, sends to SGLang engine,\nand returns the raw model response. The caller is responsible\nfor formatting the prompt and parsing the response.\n\nArgs:\n    request: GenerateRequest containing messages list and optional sampling_params\n\nReturns:\n    GenerateResponse containing raw model response text",
+        "description": "Generate response for given chat messages.\n\nTakes OpenAI-style messages as input, sends to SGLang engine,\nand returns the raw model response. The caller is responsible\nfor formatting the prompt and parsing the response.\n\nArgs:\n    request: GenerateRequest containing messages list, optional\n        sampling_params, and an optional route_key selecting which\n        genRM instance to use (defaults to the sole instance).\n\nReturns:\n    GenerateResponse containing raw model response text",
         "operationId": "generate_generate_post",
         "requestBody": {
           "content": {
@@ -48,7 +48,7 @@
     "/health": {
       "get": {
         "summary": "Health",
-        "description": "Health check endpoint.",
+        "description": "Health check endpoint; reports per-instance status.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -69,7 +69,7 @@
     "/metrics": {
       "get": {
         "summary": "Metrics",
-        "description": "Metrics endpoint.",
+        "description": "Metrics endpoint; reports per-instance stats.",
         "operationId": "metrics_metrics_get",
         "responses": {
           "200": {
@@ -121,12 +121,21 @@
               }
             ],
             "title": "Sampling Params"
+          },
+          "route_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Key"
           }
         },
         "type": "object",
-        "required": [
-          "messages"
-        ],
+        "required": ["messages"],
         "title": "GenerateRequest",
         "description": "Request model for genRM generation (OpenAI chat format).\n\nAccepts a list of messages in OpenAI format with optional sampling params."
       },
@@ -138,9 +147,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "response"
-        ],
+        "required": ["response"],
         "title": "GenerateResponse",
         "description": "Response model for genRM generation.\n\nReturns the raw model response text."
       },
@@ -169,10 +176,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "role",
-          "content"
-        ],
+        "required": ["role", "content"],
         "title": "Message",
         "description": "Single chat message."
       },
@@ -209,11 +213,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
+        "required": ["loc", "msg", "type"],
         "title": "ValidationError"
       }
     }

@@ -28,27 +28,172 @@ import torch
 import torch.multiprocessing as mp
 from PIL import Image
 
+from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
+from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
 from relax.utils.data.processing_utils import (
     adapt_processor_kwargs,
     expand_kimi_k25_placeholders,
     load_processor,
     remap_mm_train_inputs,
 )
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.multimodal.image_utils import fetch_image, resize_qwen_vl_extreme_aspect_ratio
 
 
 logger = get_logger(__name__)
 
+# fp32 mm tensors that are safe to downcast to bf16 for the shared-memory IPC + TQ
+# transfer: each is a large encoder input that gets re-cast to its encoder's weight
+# dtype downstream, so the bf16 here is lossless. Do NOT add small fp32 metadata
+# tensors (e.g. video_second_per_grid) — those are consumed at full precision.
+_BF16_DOWNCAST_KEYS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+
 # Worker-local processor instance, initialized once per worker via pool initializer.
 _worker_processor = None
+_worker_multimodal_config: MultimodalConfig | None = None
 
 
-def _init_worker(model_path: str, trust_remote_code: bool) -> None:
+def _init_worker(
+    model_path: str,
+    trust_remote_code: bool,
+    multimodal_config: MultimodalConfig | None,
+) -> None:
     """Initialize the HuggingFace processor in each worker process (called
     once)."""
-    global _worker_processor
+    global _worker_multimodal_config, _worker_processor
+    # Cap intra-op threads: a pool runs one worker per in-flight sample next to
+    # the training ranks (plus, on vision ranks, the rank-side rebuild pool), so
+    # torch's per-core default plus the job's OMP_NUM_THREADS oversubscribes the
+    # node — a 32-worker pool measured ~700 threads and its batch time stopped
+    # scaling with the pool.
+    try:
+        torch.set_num_threads(1)
+    except RuntimeError as exc:
+        logger.debug(f"Could not cap torch intra-op threads in pool worker: {exc}")
     _worker_processor = load_processor(model_path, trust_remote_code=trust_remote_code)
+    _worker_multimodal_config = multimodal_config
     logger.info(f"ProcessorPool worker initialized (pid={os.getpid()})")
+
+
+def _is_qwen_vl_processor(processor: object) -> bool:
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return False
+    for cls in type(image_processor).__mro__:
+        if cls.__module__.startswith(
+            ("transformers.models.qwen2_vl.", "transformers.models.qwen3_vl.")
+        ) and cls.__name__.startswith(("Qwen2VLImageProcessor", "Qwen3VLImageProcessor")):
+            return True
+    return False
+
+
+def _resize_images_for_processor(
+    processor: Any,
+    images: list[Image.Image],
+    multimodal_config: MultimodalConfig | None,
+) -> list[Image.Image]:
+    """Apply Relax image-token limits with the processor's actual patch
+    size."""
+    if multimodal_config is None:
+        return images
+    image_processor = getattr(processor, "image_processor", None)
+    patch_size = getattr(image_processor, "patch_size", 14)
+    if not isinstance(patch_size, int) or patch_size <= 0:
+        patch_size = 14
+    return [fetch_image({"image": image}, image_patch_size=patch_size, config=multimodal_config) for image in images]
+
+
+def get_worker_processor() -> Any:
+    """Return the processor initialized in this pool worker."""
+    if _worker_processor is None:
+        raise RuntimeError("Processor not initialized in worker process")
+    return _worker_processor
+
+
+def prepare_worker_images(images: list[np.ndarray]) -> list[Image.Image]:
+    """Restore IPC images and apply the shared producer/rebuild resize
+    rules."""
+    processor = get_worker_processor()
+    restored_images = [Image.fromarray(arr) for arr in images]
+    if _is_qwen_vl_processor(processor):
+        resized_images = []
+        for image in restored_images:
+            resized = resize_qwen_vl_extreme_aspect_ratio(image)
+            if resized is not image:
+                logger.warning(
+                    f"Qwen-VL image aspect ratio exceeded 200; resized from {image.size} to {resized.size}."
+                )
+            resized_images.append(resized)
+        restored_images = resized_images
+    return _resize_images_for_processor(processor, restored_images, _worker_multimodal_config)
+
+
+class MediaLoadError(RuntimeError):
+    """A sample's media file could not be read in a pool worker."""
+
+
+def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    """Load image/video/audio sources inside the worker.
+
+    The producer used to decode media in the parent and pickle it into the
+    pool: a 20-image sample is an ~86 MiB IPC payload and ~90 ms of parent-side
+    GIL pickling, which capped the pool at ~5 samples/s no matter how many
+    workers it had. Sending file paths (~3 KB) lets every worker read in
+    parallel — the same path-fed pipeline the rank-side rebuild already proved
+    bitwise identical to the decoded-array one.
+    """
+    loaded: dict[str, list[Any]] = {}
+    for kind in ("image", "video", "audio"):
+        sources = media_paths.get(kind) or []
+        if not sources:
+            continue
+        if kind == "image":
+            from relax.utils.multimodal.image_utils import load_image
+
+            loader = load_image
+        elif kind == "video":
+            from relax.utils.multimodal.video_utils import load_video
+
+            loader = load_video
+        else:
+            from relax.utils.multimodal.audio_utils import load_audio
+
+            loader = load_audio
+        items: list[Any] = []
+        for position, source in enumerate(sources):
+            try:
+                items.append(loader(source))
+            except Exception as exc:  # noqa: BLE001 - re-raised with position context
+                raise MediaLoadError(f"failed to load {kind} position={position}: {source!r}") from exc
+        loaded[f"{kind}s"] = items
+    return loaded
+
+
+def process_sample_from_paths_in_worker(
+    text: str,
+    media_paths: dict[str, list[Any]],
+    processor_kwargs: dict[str, Any],
+) -> tuple[list[int], dict[str, Any] | None]:
+    """``process_sample_in_worker`` with the media read inside the worker.
+
+    The load and the IPC-shaped conversion mirror the parent-side chain exactly
+    (same loaders, same ``prepare_mm_inputs_for_ipc``), so the processor sees the
+    same inputs it did when the parent shipped decoded arrays.
+
+    Raises:
+        MediaLoadError: A referenced media file could not be read (the dataset
+            maps this to its invalid-multimodal skip policy).
+    """
+    media = _load_media_for_worker(media_paths)
+    prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
+    if train_inputs is not None:
+        processor = get_worker_processor()
+        train_inputs[SFT_HF_IMAGE_REBUILD_SUPPORTED] = getattr(
+            processor, "image_processor", None
+        ) is not None and not hasattr(processor, "media_processor")
+    return prompt_ids, train_inputs
 
 
 def prepare_mm_inputs_for_ipc(multimodal_inputs: dict) -> dict:
@@ -100,17 +245,20 @@ def process_sample_in_worker(
         if _worker_processor is None:
             raise RuntimeError("Processor not initialized in worker process")
 
-        # Restore PIL Images from numpy arrays (HF processor expects PIL for some code paths)
         restored = dict(multimodal_inputs)
         if images := restored.get("images"):
-            restored["images"] = [Image.fromarray(arr) for arr in images]
+            restored["images"] = prepare_worker_images(images)
         # Videos arrive as shared-memory torch.Tensors — usable directly by the processor.
         # Audio arrives as numpy arrays — usable directly by the processor.
 
         # Translate to the processor's native call shape (no-op for Qwen-VL etc.;
         # rewrites images→medias and drops conflicting return_tensors for Kimi K2.x).
-        adapted = adapt_processor_kwargs(_worker_processor, restored, processor_kwargs)
-        processor_output = _worker_processor(text=text, **adapted)
+        kimi_request = processor_kwargs.get(KIMI_K3_SFT_REQUEST)
+        if kimi_request is not None:
+            processor_output = process_kimi_k3_sft_images(_worker_processor, restored, kimi_request)
+        else:
+            adapted = adapt_processor_kwargs(_worker_processor, restored, processor_kwargs)
+            processor_output = _worker_processor(text=text, **adapted)
 
         prompt_ids = processor_output["input_ids"][0]
         # K2.x adapt_processor_kwargs forces return_tensors="pt", so
@@ -125,12 +273,23 @@ def process_sample_in_worker(
             if isinstance(v, np.ndarray):
                 v = torch.from_numpy(v)
             if isinstance(v, torch.Tensor):
+                # Downcast the large fp32 encoder-input tensors to bf16 before the
+                # shared-memory IPC + TQ transfer (halves a ~45 GiB/batch payload).
+                # Only _BF16_DOWNCAST_KEYS are cast: each is re-cast to its encoder's
+                # weight dtype downstream, so this is lossless. It must NOT be a
+                # blanket "all fp32" downcast — small fp32 metadata is consumed at
+                # full precision and would be silently corrupted (e.g. Qwen3-Omni's
+                # `video_second_per_grid` drives mrope position IDs; bf16 rounding
+                # there drifts them irrecoverably).
+                if k in _BF16_DOWNCAST_KEYS and v.dtype == torch.float32:
+                    v = v.to(torch.bfloat16)
                 # Place in shared memory for zero-copy return via fd-based IPC.
                 # contiguous() is required: share_memory_() does not support non-contiguous storage.
                 mm_train_inputs[k] = v.contiguous().share_memory_()
 
         train_inputs = remap_mm_train_inputs(_worker_processor, mm_train_inputs or None)
-        prompt_ids = expand_kimi_k25_placeholders(_worker_processor, prompt_ids, train_inputs)
+        if kimi_request is None:
+            prompt_ids = expand_kimi_k25_placeholders(_worker_processor, prompt_ids, train_inputs)
         return prompt_ids, train_inputs
 
     except Exception as e:
@@ -177,7 +336,10 @@ class ProcessorPool:
         model_path: str,
         pool_size: int | None = None,
         trust_remote_code: bool = True,
+        multimodal_config: MultimodalConfig | None = None,
     ) -> None:
+        if pool_size is None:
+            pool_size = Envs.RELAX_PROCESSOR_POOL_SIZE
         if pool_size is None:
             pool_size = min(16, os.cpu_count() or 8)
 
@@ -186,7 +348,7 @@ class ProcessorPool:
             max_workers=pool_size,
             mp_context=ctx,
             initializer=_init_worker,
-            initargs=(model_path, trust_remote_code),
+            initargs=(model_path, trust_remote_code, multimodal_config),
         )
         self._pool_size = pool_size
         logger.info(f"ProcessorPool created with {pool_size} workers (spawn context)")

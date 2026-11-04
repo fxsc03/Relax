@@ -33,6 +33,7 @@ from typing import ContextManager, Iterator, List, Optional, Protocol
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
 
 
@@ -74,6 +75,11 @@ _MOE_DISPATCHER_CACHE_ATTRS = (
     "reversed_global_input_permutation_mapping",
     "global_input_tokens_local_experts_indices",
     "local_input_tokens_global_experts_indices",
+    "reversed_mapping_for_combine",
+    "pad_offsets",
+    "num_global_tokens_per_local_expert",
+    "local_map",
+    "local_probs",
 )
 
 # A MoE layer may keep several dispatcher handles: the active one, plus a saved
@@ -271,7 +277,7 @@ class _SelectiveOffloadStrategy:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to("cpu", non_blocking=False)
 
         gc.collect()
-        device_utils.empty_cache()
+        device_module.empty_cache()
 
     @torch.no_grad()
     def reload(self) -> None:
@@ -305,7 +311,7 @@ class _SelectiveOffloadStrategy:
         if _NON_BLOCKING:
             # The H2D copies above are async; make them observable to non-stream code
             # (and to the optimizer-state moves below) before returning.
-            device_utils.synchronize()
+            device_module.synchronize()
 
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params.
@@ -329,7 +335,7 @@ class _SelectiveOffloadStrategy:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to(device, non_blocking=False)
 
         gc.collect()
-        device_utils.empty_cache()
+        device_module.empty_cache()
 
     def disable_during_update(self) -> ContextManager:
         # Selective offload doesn't hook the allocator, so nothing to disable.
@@ -338,11 +344,9 @@ class _SelectiveOffloadStrategy:
         # it is supported on this path (no torch_memory_saver clash) and does help
         # offload()'s resize_(0) + empty_cache() hand whole segments back to the driver,
         # but it belongs to the user via --train-env-vars, not as a hidden side effect of
-        # --selective-offload. Scoping it here would not work anyway:
-        # _set_allocator_settings only affects newly created segments, so turning it off
-        # around a region cannot stop allocations from being served out of expandable
-        # blocks that already exist. See the OOM troubleshooting guide for the supported
-        # configuration.
+        # --selective-offload. The IPC bucket allocator separately scopes ordinary
+        # allocation to transport buffers, restoring the training configuration before
+        # conversion and communication continue.
         return nullcontext()
 
 
@@ -376,6 +380,12 @@ class MegatronTrainStateOffloader:
                     "torch_memory_saver hook is not LD_PRELOAD'ed; falling back to selective "
                     "offload. Pass --selective-offload to select it explicitly and silence this warning."
                 )
+
+        if self.enabled and not self.uses_tms and getattr(args, "optimizer", "adam") == "sgd":
+            raise ValueError(
+                "SGD does not support selective train-state offload; use a working "
+                "torch_memory_saver configuration or disable train-state offload."
+            )
 
         self._strategy: _OffloadStrategy = (
             _TmsOffloadStrategy() if self.uses_tms else _SelectiveOffloadStrategy(model, optimizer, args)

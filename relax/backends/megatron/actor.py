@@ -6,14 +6,15 @@ import random
 import socket
 import time
 from argparse import Namespace
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from threading import Event
 from typing import Any, List
 
 import ray
 import requests
 import torch
 import torch.distributed as dist
-import transfer_queue as tq
 from megatron.core import mpu
 
 
@@ -26,31 +27,58 @@ except ImportError:
 from tensordict import TensorDict
 from transformers import AutoConfig, AutoTokenizer
 
+from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
+from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
+    evaluation_step_for_rollout,
+    is_dpo_mode,
+    is_offline_mode,
+    is_preference_mode,
     is_sft_mode,
+    resident_sft_param_overlap_enabled,
     sft_partition_id,
+    sft_partition_ids,
     sft_task_name,
+    sft_tq_num_shards,
     should_run_sft_eval,
     should_run_sft_predict,
+    should_skip_sft_weight_management,
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
+from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.micro_batch_ring import (
+    PrefetchedSFTWindow,
+    SFTWindowPrefetcher,
+    is_sft_async_prepack_enabled,
+)
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
     StreamingTQIterator,
+    _prefetch_data_from_transfer_queue,
     create_stream_dataloader,
+    fetch_data_from_transfer_queue,
     get_data_from_transfer_queue,
     post_process_rollout_data,
 )
+from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
-from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.megatron_peft_utils import (
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+    summarize_lora_modules,
+)
+from relax.utils.memory_utils import clear_memory, manual_gc_eval, manual_gc_training, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
@@ -58,17 +86,20 @@ from relax.utils.opd.opd_utils import (
     has_managed_opd_teacher_manager,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
     _extract_audio_seqlens,
-    _extract_images_seqlens,
+    _extract_image_grids,
     get_debug_data,
     get_serve_url,
     merge_dict_list,
@@ -77,22 +108,44 @@ from relax.utils.utils import (
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
-from .checkpoint import load_checkpoint
+from .checkpoint import _checkpoint_iteration_dir, is_megatron_checkpoint, load_checkpoint
 from .collective_utils import _agree_drained
-from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
+from .cp_utils import (
+    all_gather_with_cp,
+    maybe_padded_total_lengths,
+    slice_with_cp,
+    warmup_pipeline_process_group,
+    warmup_static_cp_forward_neighbor_p2p,
+)
 from .data import (
+    ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    PrepackedBatch,
+    _get_capacity_safe_balanced_partitions,
+    _get_micro_batch_token_capacity,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
+    expand_preference_rollout_data,
     get_data_iterator,
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
+    move_tensors_to_device,
+    prepack_sft_micro_batch_cpu,
+    record_tensors_on_stream,
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import flush_resident_sft_param_sync, forward_only, initialize_model_and_optimizer, save, train
+from .reference_integrity import (
+    DPOReferenceIdentity,
+    canonical_tensor_sha256,
+    read_reference_identity,
+    reference_identity_path,
+    write_reference_identity,
+)
+from .resident_shared_expert import verify_resident_shared_readiness
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -121,6 +174,26 @@ def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
     return chunks
 
 
+def _rollout_mini_row_counts(
+    sample_indices: list[int],
+    identities_per_mini: int,
+    num_rollout_minis: int,
+) -> list[int]:
+    identity_positions = {
+        sample_index: position for position, sample_index in enumerate(dict.fromkeys(sample_indices))
+    }
+    expected_identity_count = identities_per_mini * num_rollout_minis
+    if len(identity_positions) != expected_identity_count:
+        raise RuntimeError(
+            "debug rollout logical sample count does not match rollout mini plan: "
+            f"expected={expected_identity_count}, got={len(identity_positions)}."
+        )
+    counts = [0 for _ in range(num_rollout_minis)]
+    for sample_index in sample_indices:
+        counts[identity_positions[sample_index] // identities_per_mini] += 1
+    return counts
+
+
 def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
     num_samples = len(rollout_data.get("total_lengths", []))
     if start < 0 or end < start or end > num_samples:
@@ -144,12 +217,168 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
     return {k: _slice(v) for k, v in rollout_data.items()}
 
 
+def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> RolloutBatch:
+    """Slice a rollout batch to the given per-sample indices."""
+    num_samples = len(rollout_data["total_lengths"])
+
+    def _select(value):
+        if isinstance(value, list) and len(value) == num_samples:
+            return [value[index] for index in indices]
+        if isinstance(value, tuple) and len(value) == num_samples:
+            return tuple(value[index] for index in indices)
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == num_samples:
+            return value[indices]
+        return value
+
+    return {key: _select(value) for key, value in rollout_data.items()}
+
+
+class _SFTPrefetchMiss(RuntimeError):
+    """Background prefetch did not find data within its local retry budget."""
+
+
+def _raise_if_sft_peer_error(
+    local_error: BaseException | None,
+    *,
+    phase: str,
+    device: torch.device,
+    tp_group: Any,
+    dp_group: Any,
+) -> None:
+    """Propagate a rank-local prepack failure across the TP x DP mesh."""
+    error_flag = torch.tensor([1 if local_error is not None else 0], dtype=torch.int, device=device)
+    dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=tp_group)
+    dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+    if int(error_flag.item()) == 0:
+        return
+    if local_error is not None:
+        raise local_error
+    raise RuntimeError(f"SFT prepack {phase} failed on a peer rank; aborting to avoid a distributed hang.")
+
+
+def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
+    """Avoid retaining the next prefetched window across memory-heavy step
+    boundaries."""
+    next_rollout_id = rollout_id + 1
+    is_train_done = next_rollout_id == args.num_rollout
+    should_save_after_step = args.save is not None and (
+        args.rotate_ckpt
+        or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
+    )
+    completed_steps = evaluation_step_for_rollout(args, rollout_id)
+    return (
+        should_run_sft_eval(args, completed_steps)
+        or should_run_sft_predict(args, completed_steps)
+        or should_save_after_step
+    )
+
+
+def _agree_sft_train_prefetch_result(
+    prefetched_fetch: tuple[list, float] | None,
+    local_error: BaseException | None,
+    *,
+    fatal: bool = False,
+) -> tuple[list, float] | None:
+    """Make one model-parallel replica agree on raw-prefetch fallback."""
+    state = torch.tensor(
+        [int(fatal), int(local_error is not None), int(prefetched_fetch is None), int(prefetched_fetch is not None)],
+        dtype=torch.int32,
+        device=device_utils.make_current_torch_device(),
+    )
+    groups = [mpu.get_tensor_and_context_parallel_group()]
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        groups.append(mpu.get_pipeline_model_parallel_group())
+    for group in groups:
+        dist.all_reduce(state, op=dist.ReduceOp.MAX, group=group)
+
+    peer_fatal, peer_error, peer_missing, peer_has_payload = (bool(value) for value in state.tolist())
+    if peer_fatal:
+        if fatal and local_error is not None:
+            raise local_error
+        raise RuntimeError("SFT train-data prefetch is stale on a peer rank; aborting to avoid concurrent TQ reads.")
+    if peer_error or (peer_missing and peer_has_payload):
+        return None
+    return prefetched_fetch
+
+
+class _SFTPrepackedDeviceIterator:
+    """Two-slot H2D pipeline over fully packed pinned-CPU micro-batches.
+
+    All H2D copies run on ``copy_stream``; the training thread waits on a per-
+    batch ready event before consuming a batch, and calls ``record_stream`` so
+    the caching allocator does not reclaim the pinned source before the
+    consumer stream finishes.
+    """
+
+    def __init__(
+        self,
+        packed_cpu: list[tuple[PrepackedBatch, Any]],
+        first_device_micro_batch: tuple[PrepackedBatch, Any],
+        first_ready_event: Any,
+        copy_stream: Any,
+        device: torch.device,
+    ) -> None:
+        self._packed_cpu = packed_cpu
+        self._next_device_micro_batch: tuple[PrepackedBatch, Any] | None = first_device_micro_batch
+        self._next_ready_event = first_ready_event
+        self._copy_stream = copy_stream
+        self._device = device
+        self._offset = 0
+
+    def __iter__(self) -> "_SFTPrepackedDeviceIterator":
+        return self
+
+    def __next__(self) -> tuple[PrepackedBatch, Any]:
+        if self._offset >= len(self._packed_cpu):
+            raise StopIteration
+
+        assert self._next_device_micro_batch is not None
+        current_batch, current_meta = self._next_device_micro_batch
+        train_stream = device_module.current_stream(self._device)
+        train_stream.wait_event(self._next_ready_event)
+        record_tensors_on_stream(current_batch, train_stream)
+
+        self._offset += 1
+        if self._offset < len(self._packed_cpu):
+            next_cpu_batch, next_meta = self._packed_cpu[self._offset]
+            with device_module.stream_context(self._copy_stream):
+                next_device_batch = move_tensors_to_device(next_cpu_batch, self._device, non_blocking=True)
+                next_ready_event = device_module.Event()
+                next_ready_event.record(self._copy_stream)
+            # move_tensors_to_device returns a plain dict; re-wrap so
+            # get_batch() short-circuits on the PrepackedBatch marker.
+            self._next_device_micro_batch = (PrepackedBatch(next_device_batch), next_meta)
+            self._next_ready_event = next_ready_event
+
+        return current_batch, current_meta
+
+    def close(self) -> None:
+        self._packed_cpu = []
+        self._next_device_micro_batch = None
+        self._next_ready_event = None
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @property
     def _per_step_rollout(self) -> bool:
-        """RL: rollout consumes weights every train step. SFT: only on
-        periodic predict steps; Megatron stays awake between."""
-        return not is_sft_mode(self.args)
+        """RL consumes weights every train step.
+
+        Offline training keeps Megatron awake; SFT may sync weights for
+        periodic prediction.
+        """
+        return not is_offline_mode(self.args)
+
+    def __del__(self) -> None:
+        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
+        # kills skip destructors, in which case the Mooncake master TTL
+        # reclaims the segment.
+        if getattr(self, "data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+            self.data_system_client = None
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
 
     def init(
         self,
@@ -184,11 +413,31 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.genrm_manager = None
 
-        init(args)
         if repatch is not None:
             repatch(args)
-        tq.init(args.tq_config)
-        self.data_system_client = tq.get_client()
+        init(args)
+        self.data_system_client = attach_tq_client(
+            args.tq_config,
+            role=role,
+        )
+        self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
+        self._sft_train_prefetch: Future[tuple[list, float]] | None = None
+        self._sft_train_prefetch_rollout_id: int | None = None
+        self._sft_train_prefetch_cancel: Event | None = None
+        if is_offline_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
+            self._sft_train_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="sft-tq-prefetch",
+            )
+        # --sft-image-preprocess-on-rank: vision ranks rebuild pixel tensors
+        # from image references inside the prefetch above. The CPU pool is
+        # created lazily (it needs the built model chunks for the vision check).
+        self._sft_image_preprocess_on_rank = is_sft_mode(self.args) and getattr(
+            self.args, "sft_image_preprocess_on_rank", False
+        )
+        self._sft_image_prefetch = SFTImagePrefetch(
+            self.args, partial(fetch_data_from_transfer_queue, tq_client=self.data_system_client)
+        )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
 
@@ -200,16 +449,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
-
-        # Single source of truth for VL-model routing across data prep, forward,
-        # and CP helpers. Detected by the presence of processor/preprocessor
-        # config in the HF checkpoint dir — only multimodal models ship one.
-        # This way VL models with text-only batches (no --multimodal-keys) still
-        # take the bridge VL+CP+thd path.
-        args.is_vl_model = any(
-            os.path.exists(os.path.join(args.hf_checkpoint, name))
-            for name in ("processor_config.json", "preprocessor_config.json")
-        )
 
         from relax.utils.training.flops_counter import FlopsCounter
 
@@ -226,9 +465,51 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
+        self._resident_sft_params_pending = False
+        if getattr(args, "moe_flex_dispatcher_backend", None) == "hybridep":
+            from .hybridep_preflight import validate_hybridep_worker_group
+
+            validate_hybridep_worker_group()
+        if role == "actor":
+            from relax.utils.autotune_logging import install_autotune_logging
+
+            install_autotune_logging(get_gloo_group())
+        resumed_from_megatron = not args.finetune and args.load is not None and is_megatron_checkpoint(args.load)
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        if role == "actor":
+            from relax.utils.record_function_tags import install_record_function_tags
+
+            install_record_function_tags(args, self.model)
+            if Envs.RELAX_QWEN38_RETAIN_QSA_ATTENTION:
+                from relax.models.qwen3_8.qsa_attention_recompute import configure as configure_qsa_attention_retention
+
+                configure_qsa_attention_retention(args, self.model)
+            verify_resident_shared_readiness(args, self.model)
+        self._dpo_reference_identity: DPOReferenceIdentity | None = None
+        self._expected_dpo_reference_identity: DPOReferenceIdentity | None = None
+
+        if is_lora_enabled(args) and dist.get_rank() == 0:
+            self._log_lora_checkpoint_state()
+
+        # MoE LoRA expert fold: forward-only reference models (actor_fwd / reference) receive each
+        # grouped-expert weight ALREADY folded (base + delta) into its base slot via DCS (see
+        # DeviceDirectBackend._update_expert_weight_from_distributed). This holds in BOTH rollout
+        # paths: merge mode always folds, and adapter mode folds on the actor_fwd pass (the rollout
+        # gets the pure adapter via SGLang instead). Their own grouped-expert LoRA adapters are never
+        # re-synced, so they must contribute nothing — otherwise the effective weight would be
+        # base + 2*delta. Zero them here, after the checkpoint load (a resume otherwise restores
+        # trained adapters with linear_out != 0). Non-expert adapters are kept: those ARE re-synced
+        # raw each step and carry the delta for the non-expert path. Colocate/hybrid keep the
+        # reference in-process (role stays "actor"), so this never fires there.
+        if (
+            role in ("actor_fwd", "reference")
+            and is_lora_enabled(args)
+            and (is_lora_merge_mode(args) or is_lora_adapter_mode(args))
+            and args.num_experts
+        ):
+            self._zero_expert_lora_adapters()
 
         # Train-state offload for colocate sleep/wake. Picks torch_memory_saver
         # (VMM pause) or manual selective CPU offload based on TMS availability;
@@ -244,10 +525,18 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
+        if self.args.advantage_estimator == "score_centering":
+            text_config = getattr(self.hf_config, "text_config", self.hf_config)
+            self.args.score_centering_vocab_size = text_config.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.
-        use_tensor_backuper = not self.args.fully_async or self.args.hybrid
+        skip_weight_management = should_skip_sft_weight_management(
+            self.args,
+            with_ref=with_ref,
+            with_opd_teacher=with_opd_teacher,
+        )
+        use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -255,6 +544,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.model,
                     convert_to_global_name=args.megatron_to_hf_mode == "raw",
                     translate_gpu_to_cpu=not self.args.enable_weights_backuper,
+                    include_persistent_buffers=args.megatron_to_hf_mode == "bridge",
                 ),
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
@@ -262,7 +552,13 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
 
             if with_ref:
-                self.load_other_checkpoint("ref", args.ref_load)
+                if is_dpo_mode(args):
+                    if resumed_from_megatron:
+                        identity_path = reference_identity_path(args.load, loaded_rollout_id)
+                        self._expected_dpo_reference_identity = read_reference_identity(identity_path)
+                    self._rebuild_dpo_reference(args.ref_load or args.hf_checkpoint)
+                else:
+                    self.load_other_checkpoint("ref", args.ref_load)
 
             # Load teacher model for Megatron-based on-policy distillation
             if with_opd_teacher:
@@ -301,7 +597,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else self.args.model_name,
                 quantization_config=push_quant_config,
             )
-        else:
+        elif not skip_weight_management:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
                 and mpu.get_tensor_model_parallel_rank() == 0
@@ -347,6 +643,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     lock=self.lock,
                 )
             )
+        else:
+            logger.info("Offline SFT: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization
         clear_memory()
 
@@ -366,6 +664,25 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
         self.data_iterator = None
+        self._sft_window_prefetcher = SFTWindowPrefetcher() if is_sft_async_prepack_enabled(self.args) else None
+        self._sft_prefetch_stream = None
+        self._sft_copy_stream = None
+        self._sft_device = None
+        if self._sft_window_prefetcher is not None:
+            self._validate_sft_prepack_pipeline()
+            self._sft_device = device_utils.make_current_torch_device()
+            # Two streams, one owner each: _sft_prefetch_stream is written to
+            # by the background prefetch worker for the first H2D of the next
+            # window; _sft_copy_stream is written to by the training thread
+            # for the overlapped H2D of the current window's later batches.
+            # Sharing one stream would let both host threads race on the
+            # enqueue order and let the next window's copy jump ahead of the
+            # current step's remaining copies.
+            self._sft_prefetch_stream = device_module.Stream(device=self._sft_device)
+            self._sft_copy_stream = device_module.Stream(device=self._sft_device)
+
+        if role == "actor":
+            capture_hooks.maybe_enable_for_actor()
 
         if dist.get_rank() == 0:
             logger.info(
@@ -375,9 +692,150 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    @torch.no_grad()
+    def _log_lora_checkpoint_state(self) -> None:
+        """Log (rank 0) the LoRA adapter state right after checkpoint load.
+
+        Answers "which LoRA was loaded": counts adapter params by architectural
+        role, and reports RESUMED (adapters non-zero -> loaded from a trained
+        checkpoint) vs FRESH (all-zero -> newly initialized). Detection keys on
+        ``linear_out``/``lora_B`` which init to zero; the ``.any()`` GPU sync
+        runs once at init on rank 0 and short-circuits once a non-zero is
+        found.
+        """
+        adapter_names: list[str] = []
+        resumed = False
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                if not is_lora_adapter_param(name):
+                    continue
+                adapter_names.append(name)
+                if not resumed and ("linear_out" in name or ".lora_B." in name):
+                    resumed = bool(param.detach().abs().any().item())
+        logger.info(
+            "LoRA checkpoint state (role=%s): %d adapter params, wrapped modules by role (rank0-local)=%s | %s",
+            self.role,
+            len(adapter_names),
+            summarize_lora_modules(adapter_names),
+            "RESUMED from checkpoint (adapters non-zero)" if resumed else "FRESH init (adapters zero)",
+        )
+
+    @torch.no_grad()
+    def _zero_expert_lora_adapters(self) -> None:
+        """Zero every grouped-expert LoRA adapter param on this (reference)
+        model.
+
+        Used for MoE on the actor_fwd / reference roles in BOTH rollout paths
+        (merge mode always; adapter mode on the actor_fwd fold pass): their
+        expert weights arrive pre-folded (base + delta) in the base slot and
+        their expert adapters are never re-synced, so the adapters must stay at
+        zero to avoid double-counting the delta. Covers both
+        ``.adapter.linear_in``/``.adapter.linear_out`` (Megatron-Bridge) and
+        the shared/per-expert packing (2D or 3D) transparently — a zero tensor
+        of either shape yields a zero delta. Non-expert adapters are left
+        untouched.
+        """
+        zeroed = 0
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                if ".experts." in name and is_lora_adapter_param(name):
+                    param.data.zero_()
+                    zeroed += 1
+        logger.info("[LoRA] zeroed %d grouped-expert adapter params on role=%s", zeroed, self.role)
+
+    def _validate_sft_prepack_pipeline(self) -> None:
+        unsupported = []
+        if mpu.get_pipeline_model_parallel_world_size() != 1:
+            unsupported.append("pipeline parallelism")
+        if mpu.get_context_parallel_world_size() != 1:
+            unsupported.append("context parallelism")
+        if (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) != 1:
+            unsupported.append("virtual pipeline parallelism")
+        if getattr(self.args, "dynamic_context_parallel", False):
+            unsupported.append("dynamic context parallelism")
+        if device_utils.get_device_name() != "cuda":
+            unsupported.append(f"device={device_utils.get_device_name()}")
+        if self.args.qkv_format != "thd":
+            unsupported.append(f"qkv_format={self.args.qkv_format}")
+        if unsupported:
+            raise ValueError(
+                "--sft-async-prepack currently supports THD with PP=1, CP=1 and VPP disabled; "
+                f"unsupported: {', '.join(unsupported)}."
+            )
+
+    def _flush_resident_sft_parameters(self) -> None:
+        if not getattr(self, "_resident_sft_params_pending", False):
+            return
+        flush_resident_sft_param_sync(self.model)
+        if hasattr(self, "weights_backuper"):
+            self.weights_backuper.backup("actor")
+        self._resident_sft_params_pending = False
+
+    def _resident_sft_overlap_enabled(self) -> bool:
+        if not resident_sft_param_overlap_enabled(self.args):
+            return False
+        has_backuper = hasattr(self, "weights_backuper")
+        tags = set(self.weights_backuper.backup_tags) if has_backuper else set()
+        active_tag = getattr(self, "_active_model_tag", None)
+        snapshot_actor = active_tag == "actor" and tags == {"actor"}
+        live_actor = (
+            not has_backuper
+            and active_tag is None
+            and should_skip_sft_weight_management(
+                self.args,
+                with_ref=getattr(self, "with_ref", False),
+                with_opd_teacher=getattr(self, "with_opd_teacher", False),
+            )
+        )
+        if (
+            self.role != "actor"
+            or self._per_step_rollout
+            or getattr(self, "rollout_manager", None) is not None
+            or getattr(self, "with_ref", False)
+            or getattr(self, "with_opd_teacher", False)
+            or not (snapshot_actor or live_actor)
+        ):
+            raise RuntimeError("Resident SFT overlap cannot coexist with rollout, reference/teacher or model swapping")
+        self.args._relax_resident_sft_actor_verified = True
+        return True
+
+    @timer("actor_weight_backup")
+    def _backup_actor_weights_after_train(self) -> None:
+        if not hasattr(self, "weights_backuper") or self._resident_sft_params_pending:
+            return
+        # Resident SFT eval/checkpoint readers use self.model directly. Keep
+        # initialization and explicit reader flushes intact, but avoid copying
+        # every (including frozen/CPU-offloaded) parameter after each step when
+        # no model swap or rollout consumer can read the snapshot.
+        if (
+            is_sft_mode(self.args)
+            and self.role == "actor"
+            and not self._per_step_rollout
+            and getattr(self, "rollout_manager", None) is None
+            and getattr(self, "_active_model_tag", None) == "actor"
+            and set(self.weights_backuper.backup_tags) == {"actor"}
+            and getattr(self.args, "sft_predict_interval", None) is None
+            and not any(
+                getattr(self.args, flag, False)
+                for flag in (
+                    "offload_train",
+                    "fully_async",
+                    "hybrid",
+                    "keep_old_actor",
+                    "use_critic",
+                    "compute_advantages_and_returns",
+                    "custom_megatron_before_train_step_hook_path",
+                    "rollout_data_postprocess_path",
+                )
+            )
+        ):
+            return
+        self.weights_backuper.backup("actor")
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        self._flush_resident_sft_parameters()
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -408,16 +866,136 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+        if Envs.RELAX_DEBUG_DSV4_PP_GROUP_WARMUP:
+            if getattr(self.hf_config, "model_type", None) != "deepseek_v4":
+                raise RuntimeError("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP is only supported for DeepSeek-V4")
+
+            from megatron.core.utils import get_model_config
+
+            config = get_model_config(self.model[0])
+            if mpu.get_pipeline_model_parallel_world_size() <= 2:
+                raise RuntimeError("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP requires pipeline parallel size > 2")
+            if not config.variable_seq_lengths or not config.batch_p2p_comm:
+                raise RuntimeError(
+                    "RELAX_DEBUG_DSV4_PP_GROUP_WARMUP requires variable sequence lengths and batched P2P"
+                )
+            # The first NCCL batch_isend_irecv on a process group requires
+            # every group rank to participate. Variable-shape PP exchanges
+            # otherwise let only the first adjacent stages enter that call.
+            warmup_pipeline_process_group()
+        if Envs.RELAX_DEBUG_DSV4_CP_P2P_WARMUP:
+            if getattr(self.hf_config, "model_type", None) != "deepseek_v4":
+                raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP is only supported for DeepSeek-V4")
+            if getattr(self.args, "dynamic_context_parallel", False):
+                raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP only supports static context parallelism")
+            warmup_static_cp_forward_neighbor_p2p()
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
+        self._flush_resident_sft_parameters()
         # Backend-specific bookkeeping is handled in device utils so this
         # framework path stays hardware-agnostic.
         device_utils.maybe_backend_process_on_model_switch()
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+        if self._active_model_tag == target_tag:
+            # Same-tag restore would be a byte-identical copy: paths that
+            # deliberately dirty the weights clear the tag first (see
+            # _rebuild_dpo_reference), so skipping avoids a redundant
+            # full-weight CPU->GPU copy per step after the ref forward.
+            return
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _is_standard_dpo(self) -> bool:
+        return is_dpo_mode(self.args) and not self.args.dpo_reference_free
+
+    def _assert_dp_reference_digest_equal(self, digest: str) -> None:
+        digests = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(digests, digest, group=get_gloo_group())
+        if len(set(digests)) != 1:
+            raise RuntimeError(f"DPO frozen-reference parameter digests differ across ranks: {digests}")
+
+    def _assert_dpo_reference_identity(self, actual: DPOReferenceIdentity) -> None:
+        expected = self._expected_dpo_reference_identity
+        if expected is None:
+            return
+        if expected.parameter_sha256 != actual.parameter_sha256:
+            raise RuntimeError(
+                "DPO frozen-reference identity mismatch: "
+                f"expected parameter_sha256={expected.parameter_sha256}, actual={actual.parameter_sha256}"
+            )
+
+    def _rebuild_dpo_reference(self, path: str) -> None:
+        """Transactionally rebuild a frozen reference without touching
+        optimizer state."""
+        if self._active_model_tag != "actor" or "actor" not in self.weights_backuper.backup_tags:
+            raise RuntimeError("DPO reference rebuild requires an active actor backup")
+        if is_model_source_alias(self.args, path):
+            path = self.args.hf_checkpoint
+        if not os.path.isdir(path) or not (
+            is_megatron_checkpoint(path) or os.path.isfile(os.path.join(path, "config.json"))
+        ):
+            raise ValueError(f"DPO reference must be an existing Hugging Face or Megatron checkpoint: {path}")
+        reference_step = self.args.ref_ckpt_step
+        if is_megatron_checkpoint(path):
+            iteration_dir = _checkpoint_iteration_dir(path, reference_step)
+            if not iteration_dir.is_dir() or not any(iteration_dir.iterdir()):
+                raise ValueError(f"DPO reference checkpoint iteration is missing or empty: {iteration_dir}")
+            # Megatron loads from the root plus a step, including when the user
+            # supplied an iteration directory directly.
+            path = str(iteration_dir.parent)
+            reference_step = int(iteration_dir.name[5:]) if iteration_dir.name.startswith("iter_") else None
+            tracker = iteration_dir.parent / "latest_checkpointed_iteration.txt"
+            if not tracker.is_file():
+                raise ValueError(f"DPO reference checkpoint root is missing its tracker: {tracker}")
+            latest = tracker.read_text().strip()
+            if (reference_step == 0 and latest != "0") or (
+                latest == "release" and self.args.ref_ckpt_step is not None
+            ):
+                raise ValueError(
+                    "Megatron cannot select this reference step from the current tracker; "
+                    "use a checkpoint root whose tracker points to the requested reference step"
+                )
+        old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
+        old_ckpt_step = self.args.ckpt_step
+        old_non_persistent_ckpt_type = self.args.non_persistent_ckpt_type
+        try:
+            self.args.load = path
+            self.args.ckpt_step = reference_step
+            self.args.non_persistent_ckpt_type = None
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
+            self._active_model_tag = None
+            load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+            candidate_sha256 = canonical_tensor_sha256(
+                named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=True,
+                )
+            )
+            self._assert_dp_reference_digest_equal(candidate_sha256)
+            candidate = DPOReferenceIdentity(
+                schema_version=2,
+                parameter_sha256=candidate_sha256,
+            )
+            self._assert_dpo_reference_identity(candidate)
+            self.weights_backuper.backup("ref")
+            self._dpo_reference_identity = candidate
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            self.args.ckpt_step = old_ckpt_step
+            self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
+            self._switch_model("actor")
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -476,8 +1054,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # matches the bridge; the per-CP-rank stream is then tp-divisible, so no global pad (the
             # bridge adds none either).
             #
-            # Otherwise (non-VL) the forward uses get_batch's per-sample slice_with_cp (2*cp align)
-            # + global tp*data_pad_size_multiplier pad, so mirror that here.
+            # For non-VL allgather CP, get_batch concatenates the global stream first, pads it to
+            # cp*tp*data_pad_size_multiplier, then takes one contiguous chunk per CP rank.  Otherwise
+            # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
+            # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
             padded_total_lengths = maybe_padded_total_lengths(
                 [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
             )
@@ -485,16 +1065,27 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_routed_experts = [
                     pad_func(r, padded_total_lengths[i] - r.shape[0]) for i, r in enumerate(rollout_routed_experts)
                 ]
+                rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
             else:
                 # Pad each sample by 1 (the last, non-loss token) so it matches the token length.
                 rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
-            rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            if padded_total_lengths is None:
                 pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-                pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-                if pad != 0:
-                    rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+                cp_size = mpu.get_context_parallel_world_size()
+                if self.args.allgather_cp and cp_size > 1:
+                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                    global_pad_size = cp_size * pad_size
+                    pad = (global_pad_size - rollout_routed_experts.size(0) % global_pad_size) % global_pad_size
+                    if pad != 0:
+                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+                    cp_rank = mpu.get_context_parallel_rank()
+                    rollout_routed_experts = rollout_routed_experts.chunk(cp_size, dim=0)[cp_rank]
+                else:
+                    rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                    pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+                    if pad != 0:
+                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
 
             if self.args.sequence_parallel:
                 seqlen = rollout_routed_experts.size(0)
@@ -528,6 +1119,190 @@ class MegatronTrainRayActor(TrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
+    def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
+        """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
+        from relax.utils.training.indexer_replay import IndexerReplay
+
+        if "rollout_indexer_topk" not in rollout_data:
+            raise ValueError(
+                "rollout_indexer_topk is required in rollout_data when use_rollout_indexer_replay is set."
+            )
+
+        from megatron.core.transformer.transformer_block import get_num_layers_to_build
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        for iterator in data_iterator:
+            iterator.reset()
+
+        layer_to_ordinal: dict[int, int] = {}
+        local_layer_numbers: list[int] = []
+        indexer_topk = None
+        for vp_stage, model in enumerate(self.model):
+            config = model.module.config
+            ratios_value = getattr(config, "csa_compress_ratios", None)
+            if ratios_value is None or not hasattr(config, "dsa_indexer_topk"):
+                raise RuntimeError("Rollout indexer replay requires a DeepSeek-V4 hybrid Megatron model")
+            indexer_loss_coeff = getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+            if indexer_loss_coeff != 0.0:
+                raise RuntimeError(
+                    "Rollout indexer replay requires dsa_indexer_loss_coeff=0, "
+                    f"got {indexer_loss_coeff} from the Megatron model config"
+                )
+            ratios = list(ratios_value)
+            if len(ratios) < config.num_layers:
+                raise RuntimeError(
+                    f"DSV4 csa_compress_ratios has {len(ratios)} entries for {config.num_layers} layers"
+                )
+            c4_ordinal = 0
+            for layer_id, ratio in enumerate(ratios[: config.num_layers]):
+                if ratio == 4:
+                    layer_to_ordinal[layer_id] = c4_ordinal
+                    c4_ordinal += 1
+
+            model_topk = int(config.dsa_indexer_topk)
+            if indexer_topk is not None and indexer_topk != model_topk:
+                raise RuntimeError(f"Inconsistent DSV4 indexer top-k widths: {indexer_topk} vs {model_topk}")
+            indexer_topk = model_topk
+
+            num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+            offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+            local_layer_numbers.extend(
+                layer_id + 1
+                for layer_id in range(offset, offset + num_layers_to_build)
+                if layer_id in layer_to_ordinal
+            )
+
+        if indexer_topk is None:
+            raise RuntimeError("No Megatron model config was available for DSV4 indexer replay")
+        if not layer_to_ordinal:
+            raise RuntimeError("The Megatron model has no DeepSeek-V4 C4 indexer layers to replay")
+        if len(local_layer_numbers) != len(set(local_layer_numbers)):
+            raise RuntimeError(f"Duplicate local DSV4 indexer replay layers: {local_layer_numbers}")
+        local_ordinals = [layer_to_ordinal[layer_number - 1] for layer_number in local_layer_numbers]
+        IndexerReplay.begin_step(local_layer_numbers)
+        for model in self.model:
+            model.module.config.relax_use_indexer_replay = True
+
+        def pad_rows(tensor: torch.Tensor, count: int, value: int | bool) -> torch.Tensor:
+            if count == 0:
+                return tensor
+            padding = torch.full(
+                (count, *tensor.shape[1:]),
+                value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            return torch.cat((tensor, padding), dim=0)
+
+        try:
+            for _ in range(sum(num_microbatches)):
+                batch = data_iterator[0].get_next(["rollout_indexer_topk", "tokens"])
+                flat_indexer_topk = batch["rollout_indexer_topk"]
+                tokens = batch["tokens"]
+                if flat_indexer_topk is None or tokens is None:
+                    raise RuntimeError("Missing indexer replay or tokens in a replay microbatch")
+                if len(flat_indexer_topk) != len(tokens):
+                    raise RuntimeError(
+                        f"Indexer replay sample count {len(flat_indexer_topk)} != token sample count {len(tokens)}"
+                    )
+
+                per_sample_topk = []
+                per_sample_valid = []
+                for flat, sample_tokens in zip(flat_indexer_topk, tokens, strict=False):
+                    if flat.dtype != torch.int32:
+                        raise RuntimeError(f"SGLang indexer replay must use int32, got {flat.dtype}")
+                    if flat.ndim != 2 or flat.shape[0] != sample_tokens.shape[0] - 1:
+                        raise RuntimeError(
+                            "SGLang indexer replay rows must equal token rows minus one, "
+                            f"got replay={tuple(flat.shape)}, tokens={tuple(sample_tokens.shape)}"
+                        )
+                    if flat.shape[1] % indexer_topk != 0:
+                        raise RuntimeError(
+                            f"SGLang indexer replay width {flat.shape[1]} is not divisible by top-k {indexer_topk}"
+                        )
+                    num_slots = flat.shape[1] // indexer_topk
+                    if num_slots != len(layer_to_ordinal):
+                        raise RuntimeError(
+                            f"SGLang returned {num_slots} C4 slots but Megatron expects {len(layer_to_ordinal)}"
+                        )
+                    reshaped = flat.reshape(flat.shape[0], num_slots, indexer_topk)
+                    per_sample_topk.append(reshaped[:, local_ordinals, :])
+                    per_sample_valid.append(torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device))
+
+                padded_total_lengths = maybe_padded_total_lengths(
+                    [t.shape[0] for t in tokens],
+                    self.args.qkv_format,
+                    getattr(self.args, "is_vl_model", False),
+                )
+                if padded_total_lengths is not None:
+                    per_sample_topk = [
+                        pad_rows(replay, padded_total_lengths[i] - replay.shape[0], -1)
+                        for i, replay in enumerate(per_sample_topk)
+                    ]
+                    per_sample_valid = [
+                        pad_rows(valid, padded_total_lengths[i] - valid.shape[0], False)
+                        for i, valid in enumerate(per_sample_valid)
+                    ]
+                    packed_topk = torch.cat(
+                        [
+                            slice_with_cp(replay, lambda value, count: pad_rows(value, count, -1))
+                            for replay in per_sample_topk
+                        ],
+                        dim=0,
+                    )
+                    packed_valid = torch.cat(
+                        [
+                            slice_with_cp(valid, lambda value, count: pad_rows(value, count, False))
+                            for valid in per_sample_valid
+                        ],
+                        dim=0,
+                    )
+                else:
+                    per_sample_topk = [pad_rows(replay, 1, -1) for replay in per_sample_topk]
+                    per_sample_valid = [pad_rows(valid, 1, False) for valid in per_sample_valid]
+                    pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+                    cp_size = mpu.get_context_parallel_world_size()
+                    if self.args.allgather_cp and cp_size > 1:
+                        packed_topk = torch.cat(per_sample_topk, dim=0)
+                        packed_valid = torch.cat(per_sample_valid, dim=0)
+                        global_pad_size = cp_size * pad_size
+                        pad = (global_pad_size - packed_topk.shape[0] % global_pad_size) % global_pad_size
+                        packed_topk = pad_rows(packed_topk, pad, -1)
+                        packed_valid = pad_rows(packed_valid, pad, False)
+                        cp_rank = mpu.get_context_parallel_rank()
+                        packed_topk = packed_topk.chunk(cp_size, dim=0)[cp_rank]
+                        packed_valid = packed_valid.chunk(cp_size, dim=0)[cp_rank]
+                    else:
+                        packed_topk = torch.cat(
+                            [
+                                slice_with_cp(replay, lambda value, count: pad_rows(value, count, -1))
+                                for replay in per_sample_topk
+                            ],
+                            dim=0,
+                        )
+                        packed_valid = torch.cat(
+                            [
+                                slice_with_cp(valid, lambda value, count: pad_rows(value, count, False))
+                                for valid in per_sample_valid
+                            ],
+                            dim=0,
+                        )
+                        pad = (pad_size - packed_topk.shape[0] % pad_size) % pad_size
+                        packed_topk = pad_rows(packed_topk, pad, -1)
+                        packed_valid = pad_rows(packed_valid, pad, False)
+
+                local_topk = packed_topk.contiguous()
+                for column, layer_number in enumerate(local_layer_numbers):
+                    IndexerReplay.record(layer_number, local_topk[:, column, :], packed_valid)
+        except Exception:
+            IndexerReplay.clear()
+            raise
+        finally:
+            for iterator in data_iterator:
+                iterator.reset()
+
+        del rollout_data["rollout_indexer_topk"]
+
     def compute_log_prob(
         self,
         data_iterator: list[DataIterator],
@@ -549,30 +1324,35 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        is_sft = is_sft_mode(self.args)
+        is_offline = is_offline_mode(self.args)
         has_rollout = getattr(self, "rollout_manager", None) is not None
 
-        if not is_sft and dist.get_rank() != 0:
+        if not is_offline and dist.get_rank() != 0:
             return
 
-        if is_sft:
+        if is_offline:
             should_run_eval = should_run_sft_eval(self.args, rollout_id)
             should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
+            if should_run_eval or should_run_predict:
+                self._flush_resident_sft_parameters()
             try:
                 if should_run_eval:
-                    if dist.get_rank() == 0:
-                        run(
-                            self.data_system_client.async_clear_partition(
-                                partition_id=sft_partition_id(self.args, rollout_id)
+                    if rollout_id > 0 and dist.get_rank() == 0:
+                        for partition_id in sft_partition_ids(self.args, rollout_id - 1):
+                            run(
+                                self.data_system_client.async_clear_partition(
+                                    partition_id=partition_id,
+                                )
                             )
-                        )
                     dist.barrier(group=get_gloo_group())
-                    run_sft_eval(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_eval(self, rollout_id)
 
                 if should_run_predict:
-                    run_sft_predict(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_predict(self, rollout_id)
             except Exception as e:
-                logger.warning(f"SFT eval/predict at rollout_id {rollout_id} failed: {e}")
+                logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
             return
 
@@ -609,11 +1389,13 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @manual_gc_training
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
-                pre_train_offload_handles.append(self.genrm_manager.offload.remote())
+                # A list of one or more GenRM manager handles (one per instance).
+                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
             append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
             if pre_train_offload_handles:
                 ray.get(pre_train_offload_handles)
@@ -631,24 +1413,21 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for debug with mcore.")
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-            if is_sft_mode(self.args):
+            if is_offline_mode(self.args):
                 batch_size = self.args.global_batch_size // dp_size
                 rollout_mini_local_sample_counts = None
             else:
                 plan = build_rollout_minibatch_plan(self.args, dp_size)
                 batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
-                rollout_mini_local_sample_counts = [
-                    plan.mini_local_sample_request for _ in range(plan.num_rollout_minis)
-                ]
+                rollout_mini_local_sample_counts = None
             rollout_data = get_debug_data(self.args, rollout_id, batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, rollout_data)
-            if rollout_mini_local_sample_counts is not None:
-                if sum(rollout_mini_local_sample_counts) != len(rollout_data["total_lengths"]):
-                    raise RuntimeError(
-                        "debug rollout data size does not match rollout mini plan: "
-                        f"counts={rollout_mini_local_sample_counts}, "
-                        f"num_local_samples={len(rollout_data['total_lengths'])}"
-                    )
+            if not is_offline_mode(self.args):
+                rollout_mini_local_sample_counts = _rollout_mini_row_counts(
+                    rollout_data["sample_indices"],
+                    plan.mini_local_sample_request,
+                    plan.num_rollout_minis,
+                )
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
             if self.role == "critic":
@@ -657,7 +1436,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 return self.train_actor(rollout_id, rollout_data)
         else:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train with mcore.")
-            if is_sft_mode(self.args):
+            if is_offline_mode(self.args):
                 batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(
                     with_context_parallel=False
                 )
@@ -679,21 +1458,59 @@ class MegatronTrainRayActor(TrainRayActor):
             # zero mini batches. Use a role-specific task_name so consumption is
             # tracked independently per consumer.
             base_task_name = sft_task_name(self.args, component="backend")
-            if not is_sft_mode(self.args) and self.role == "critic":
+            if not is_offline_mode(self.args) and self.role == "critic":
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
+            if is_sft_mode(self.args) and self._sft_window_prefetcher is not None:
+                data_fields = build_data_fields(self.args, consumer="actor")
+                rollout_data, prepared_iterator, num_microbatches = self._get_prefetched_sft_window(
+                    task_name,
+                    rollout_id,
+                    data_fields,
+                )
+                return self.train_actor(
+                    rollout_id,
+                    rollout_data,
+                    prepared_data_iterator=[prepared_iterator],
+                    prepared_num_microbatches=[num_microbatches],
+                )
+            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
-            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             fetch_iter = 0
-            while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
+            while batch_index < num_rollout_minis:
+                # ``get_meta`` marks a TQ partition consumed.  A CPU-prefetched
+                # SFT batch therefore looks consumed before the main training
+                # thread has finalized and trained it.  Keep the fetch loop
+                # alive for that exact prefetched rollout; all other paths
+                # retain the normal consumed-partition exit condition.
+                has_prefetched_sft_batch = (
+                    is_offline_mode(self.args)
+                    and self._sft_train_prefetch is not None
+                    and self._sft_train_prefetch_rollout_id == rollout_id
+                )
+                from relax.utils.data.wholepack import all_ready
+                from relax.utils.data.wholepack import enabled as wholepack_enabled
+
+                drained = not has_prefetched_sft_batch and self.all_consumed(task_name, rollout_id)
+                if wholepack_enabled(self.args):
+                    drained = all_ready(drained)
+                if drained:
+                    break
                 consumer = "critic" if self.role == "critic" else "actor"
                 data_fields = build_data_fields(self.args, consumer=consumer)
                 with timer("train_get_data"):
+                    prefetched_fetch = self._take_sft_train_prefetch(rollout_id)
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
-                        task_name, rollout_id, data_fields, batch_size, batch_index
+                        task_name,
+                        rollout_id,
+                        data_fields,
+                        batch_size,
+                        batch_index,
+                        prefetched_fetch=prefetched_fetch,
+                        wholepack_training=wholepack_enabled(self.args),
                     )
                 if rollout_data is None:
                     if fetch_iter % 100 == 0:
@@ -707,34 +1524,469 @@ class MegatronTrainRayActor(TrainRayActor):
                         time.sleep(empty_poll_sleep_s)
                     continue
                 batch_index += 1
-                if is_sft_mode(self.args):
+                if is_offline_mode(self.args):
+                    # Start N+1 only after every rank has finalized N. A raw
+                    # prefetch can return empty on a subset of ranks while the
+                    # producer is publishing the partition; scheduling N+1
+                    # before _agree_on_fetch then makes those ranks discard it
+                    # as stale when they retry N. The current step's compute is
+                    # much longer than finalization, so this still hides the TQ
+                    # RPC without consuming partitions out of order.
+                    self._start_sft_train_prefetch(rollout_id, task_name, data_fields, batch_size)
                     if self.role == "critic":
                         return self.train_critic(rollout_id, rollout_data)
                     else:
                         return self.train_actor(rollout_id, rollout_data)
-                if len(rollout_data["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"rollout mini batch local size mismatch for rollout_id={rollout_id}, "
-                        f"batch_index={batch_index - 1}: expected {batch_size}, "
-                        f"got {len(rollout_data['total_lengths'])}."
-                    )
                 rollout_mini_batches.append(rollout_data)
                 rollout_mini_batch_metas.append(batch_meta)
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
 
-            if not is_sft_mode(self.args):
+            if not is_offline_mode(self.args):
                 if len(rollout_mini_batches) != num_rollout_minis:
                     raise RuntimeError(
                         f"Expected {num_rollout_minis} rollout mini batches for rollout_id={rollout_id}, "
                         f"got {len(rollout_mini_batches)}."
                     )
                 rollout_data = concat_rollout_batches(rollout_mini_batches)
+                if getattr(self.args, "use_rollout_indexer_replay", False):
+                    for mini_batch in rollout_mini_batches:
+                        mini_batch.pop("rollout_indexer_topk", None)
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
                 rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
+                if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+                    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [dynamic_size]
                 if self.role == "critic":
                     return self.train_critic(rollout_id, rollout_data)
                 else:
                     return self.train_actor(rollout_id, rollout_data)
+
+    def _get_prefetched_sft_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> tuple[RolloutBatch, _SFTPrepackedDeviceIterator, int]:
+        assert self._sft_window_prefetcher is not None
+        identity = (task_name, tuple(data_fields))
+        self._sft_window_prefetcher.prefetch(
+            rollout_id,
+            partial(self._fetch_and_prepack_sft_window, task_name, rollout_id, data_fields),
+            identity=identity,
+        )
+        # Capture prefetch failure locally so all ranks can synchronize on
+        # error status before touching any collective. A background TQ /
+        # packing / pin failure on one rank must not leave peer ranks stuck
+        # in the first all_reduce below.
+        device = device_utils.make_current_torch_device()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        local_error: BaseException | None = None
+        window = None
+        with timer("sft_prefetch_wait"):
+            try:
+                window = self._sft_window_prefetcher.get(rollout_id)
+            except _SFTPrefetchMiss:
+                window = None
+            except BaseException as exc:  # noqa: BLE001
+                local_error = exc
+
+        window = self._agree_sft_prefetch_window(task_name, rollout_id, data_fields, window, local_error)
+
+        local_k = len(window.packed_micro_batches)
+        local_samples = len(window.rollout_data["total_lengths"])
+
+        # Run every collective unconditionally, aggregate failure into a
+        # single global bit, then raise together. Raising between collectives
+        # would leave peers stuck in the next all_reduce.
+        # tp_bounds: [max_k, -min_k, max_samples, -min_samples] MAX-reduced
+        # across TP replicas. Only tp_max_k / TP sample-count agreement are
+        # used downstream; tp_min_k folds into DP-wide MAX below.
+        tp_bounds = torch.tensor([local_k, -local_k, local_samples, -local_samples], dtype=torch.int, device=device)
+        dist.all_reduce(tp_bounds, op=dist.ReduceOp.MAX, group=tp_group)
+        tp_max_k = int(tp_bounds[0].item())
+        tp_max_samples, tp_min_samples = int(tp_bounds[2].item()), -int(tp_bounds[3].item())
+
+        dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
+        dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
+        max_k = int(dp_k_bounds[0].item())
+
+        global_samples = torch.tensor([local_samples], dtype=torch.int, device=device)
+        dist.all_reduce(global_samples, op=dist.ReduceOp.SUM, group=dp_group)
+        total_samples = int(global_samples.item())
+
+        errors: list[str] = []
+        if tp_max_samples != tp_min_samples:
+            errors.append(f"real sample count differs across TP ranks (min={tp_min_samples}, max={tp_max_samples})")
+        if total_samples != self.args.global_batch_size:
+            errors.append(
+                f"sample count mismatch (expected global_batch_size={self.args.global_batch_size}, got {total_samples})"
+            )
+        validation_error = None
+        if errors:
+            validation_error = RuntimeError(
+                f"SFT prefetch validation failed for rollout_id={rollout_id}: " + "; ".join(errors) + "."
+            )
+        _raise_if_sft_peer_error(
+            validation_error,
+            phase=f"validation for rollout_id={rollout_id}",
+            device=device,
+            tp_group=tp_group,
+            dp_group=dp_group,
+        )
+
+        packed_micro_batches = window.packed_micro_batches
+        first_device_micro_batch = window.first_device_micro_batch
+        first_ready_event = window.first_ready_event
+
+        # Match get_data_iterator: first agree on DP-wide K, then repartition
+        # every rank's real samples into that K. Repeating a complete local
+        # micro-batch as a zero-loss dummy still runs its full forward/backward
+        # and made long-sequence SFT substantially slower.
+        repack_error: BaseException | None = None
+        if local_k < max_k:
+            try:
+                first_ready_event.synchronize()
+                capacity = _get_micro_batch_token_capacity(
+                    self.args, self.args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
+                )
+                micro_batch_indices = _get_capacity_safe_balanced_partitions(
+                    window.rollout_data["total_lengths"], max_k, capacity
+                )
+                packed_micro_batches = [
+                    (
+                        prepack_sft_micro_batch_cpu(
+                            self.args,
+                            _select_rollout_samples(window.rollout_data, indices),
+                        ),
+                        None,
+                    )
+                    for indices in micro_batch_indices
+                ]
+
+                assert self._sft_copy_stream is not None
+                assert self._sft_device is not None
+                with device_module.stream_context(self._sft_copy_stream):
+                    first_cpu_batch, first_meta = packed_micro_batches[0]
+                    first_device_batch = PrepackedBatch(
+                        move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
+                    )
+                    first_ready_event = device_module.Event()
+                    first_ready_event.record(self._sft_copy_stream)
+                first_device_micro_batch = (first_device_batch, first_meta)
+            except BaseException as exc:  # noqa: BLE001
+                repack_error = exc
+        _raise_if_sft_peer_error(
+            repack_error,
+            phase=f"repack for rollout_id={rollout_id}",
+            device=device,
+            tp_group=tp_group,
+            dp_group=dp_group,
+        )
+        local_k = max_k
+
+        next_rollout_id = rollout_id + 1
+        should_pause_lookahead = _should_pause_sft_lookahead(self.args, rollout_id)
+        if next_rollout_id < self.args.num_rollout and self.args.max_staleness >= 1 and not should_pause_lookahead:
+            self._sft_window_prefetcher.prefetch(
+                next_rollout_id,
+                partial(self._fetch_and_prepack_sft_window, task_name, next_rollout_id, data_fields),
+                identity=(task_name, tuple(data_fields)),
+            )
+
+        assert self._sft_copy_stream is not None
+        assert self._sft_device is not None
+        iterator = _SFTPrepackedDeviceIterator(
+            packed_micro_batches,
+            first_device_micro_batch,
+            first_ready_event,
+            self._sft_copy_stream,
+            self._sft_device,
+        )
+        return window.rollout_data, iterator, local_k
+
+    def _sft_prepack_local_batch_size(self) -> int:
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        if self.args.global_batch_size % dp_size != 0:
+            raise ValueError(
+                "--sft-async-prepack requires global_batch_size divisible by data parallel size, "
+                f"got global_batch_size={self.args.global_batch_size}, dp_size={dp_size}."
+            )
+        return self.args.global_batch_size // dp_size
+
+    def _fetch_sft_prepack_rollout_once(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> RolloutBatch | None:
+        # The producer writes exactly one global SFT batch per partition. Use
+        # the regular seqlen-balanced sampler to fetch the complete local shard
+        # in one request, just like the stable non-prepack path. Streaming
+        # token-budget rounds wait on straggling tail samples and their polling
+        # backoff can turn a small producer skew into multi-second stalls.
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        batch_size = self._sft_prepack_local_batch_size()
+        partition_ids = sft_partition_ids(self.args, rollout_id)
+        num_shards = sft_tq_num_shards(self.args)
+        if len(partition_ids) != num_shards:
+            raise RuntimeError(
+                f"SFT shard partition mismatch for rollout_id={rollout_id}: "
+                f"partition_ids={partition_ids}, num_shards={num_shards}."
+            )
+
+        if num_shards <= 1:
+            partition_id = partition_ids[0]
+            sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
+            rollout_data, _batch_meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+                synchronize_per_rank_fetch=False,
+            )
+            return rollout_data
+
+        if batch_size % num_shards != 0:
+            raise ValueError(
+                "RELAX_SFT_TQ_SHARDS requires each DP local SFT batch to be divisible by shard count, "
+                f"got local_batch_size={batch_size}, num_shards={num_shards}."
+            )
+
+        # Avoid partially consuming shard 0 while shard N is not produced yet.
+        partitions = run(self.data_system_client.async_get_partition_list())
+        if partitions is None or any(partition_id not in partitions for partition_id in partition_ids):
+            return None
+
+        shard_batch_size = batch_size // num_shards
+        shard_batches: list[RolloutBatch] = []
+        for shard_id, partition_id in enumerate(partition_ids):
+            sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
+            rollout_data, _batch_meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=shard_batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+                synchronize_per_rank_fetch=False,
+            )
+            if rollout_data is None:
+                if shard_id > 0:
+                    raise RuntimeError(
+                        f"SFT shard fetch split for rollout_id={rollout_id}: shard {shard_id} returned no data "
+                        "after earlier shards were consumed. Check producer partition readiness."
+                    )
+                return None
+            shard_batches.append(rollout_data)
+
+        return concat_rollout_batches(shard_batches)
+
+    def _pack_sft_prepack_window(
+        self,
+        rollout_id: int,
+        rollout_data: RolloutBatch,
+        prefetch_started: float,
+        drain_finished: float,
+    ) -> PrefetchedSFTWindow:
+        batch_size = self._sft_prepack_local_batch_size()
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        if len(rollout_data["total_lengths"]) != batch_size:
+            raise RuntimeError(
+                f"SFT prefetch local shard size mismatch for rollout_id={rollout_id}: "
+                f"expected {batch_size}, got {len(rollout_data['total_lengths'])}."
+            )
+
+        # K_local is speculative so CPU packing can stay in the background.
+        # The training thread performs the DP-wide MAX and only short ranks
+        # repack their real samples to K_global.
+        samples = rollout_data["total_lengths"]
+        # CP=1 by _validate_sft_prepack_pipeline; cp_size factor is a no-op
+        # but kept explicit to mirror get_data_iterator's formula.
+        cp_size = mpu.get_context_parallel_world_size()
+        max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
+        k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
+        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
+        packed_cpu = [
+            (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
+            for indices in micro_batch_indices
+        ]
+        packing_finished = time.monotonic()
+
+        assert self._sft_prefetch_stream is not None
+        assert self._sft_device is not None
+        device_module.set_device(self._sft_device)
+        # First H2D goes on the prefetch-owned stream so the training thread's
+        # _sft_copy_stream (used by _SFTPrepackedDeviceIterator) never has
+        # background enqueues racing in front of the current step's copies.
+        with device_module.stream_context(self._sft_prefetch_stream):
+            first_cpu_batch, first_meta = packed_cpu[0]
+            first_device_batch = PrepackedBatch(
+                move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
+            )
+            first_ready_event = device_module.Event()
+            first_ready_event.record(self._sft_prefetch_stream)
+
+        logger.info(
+            "[sft-prepack] rollout=%d dp=%d real_samples=%d micro_batches=%d "
+            "tq_drain=%.3fs cpu_pack_pin=%.3fs first_h2d_enqueue=%.3fs",
+            rollout_id,
+            dp_rank,
+            len(rollout_data["total_lengths"]),
+            len(packed_cpu),
+            drain_finished - prefetch_started,
+            packing_finished - drain_finished,
+            time.monotonic() - packing_finished,
+        )
+
+        return PrefetchedSFTWindow(
+            rollout_id=rollout_id,
+            rollout_data=rollout_data,
+            packed_micro_batches=packed_cpu,
+            first_device_micro_batch=(first_device_batch, first_meta),
+            first_ready_event=first_ready_event,
+        )
+
+    def _fetch_sft_prepack_window_once(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> PrefetchedSFTWindow | None:
+        fetch_started = time.monotonic()
+        rollout_data = self._fetch_sft_prepack_rollout_once(task_name, rollout_id, data_fields)
+        if rollout_data is None:
+            return None
+        return self._pack_sft_prepack_window(rollout_id, rollout_data, fetch_started, time.monotonic())
+
+    def _agree_sft_prefetch_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+        window: PrefetchedSFTWindow | None,
+        local_error: BaseException | None,
+    ) -> PrefetchedSFTWindow:
+        device = device_utils.make_current_torch_device()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+
+        error_flag = torch.tensor([1 if local_error is not None else 0], dtype=torch.int, device=device)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=tp_group)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+        if int(error_flag.item()) != 0:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                f"SFT prefetch failed on a peer rank for rollout_id={rollout_id}; "
+                "aborting to avoid a distributed hang."
+            )
+
+        # Any recovery collectives run in the training thread. The background
+        # worker is deliberately limited to rank-local TQ RPC, CPU packing, and
+        # H2D enqueue so it cannot interleave NCCL with model fwd/bwd collectives.
+        max_retries = Envs.RELAX_FETCH_SPLIT_MAX_RETRIES
+        split_attempt = 0
+        empty_attempt = 0
+        recovery_error: BaseException | None = None
+        while True:
+            has_window = window is not None
+            status = torch.tensor(
+                [1 if has_window else 0, 0 if has_window else 1, 1 if recovery_error is not None else 0],
+                dtype=torch.int,
+                device=device,
+            )
+            dist.all_reduce(status, op=dist.ReduceOp.SUM, group=tp_group)
+            got, missing, failed = status.tolist()
+
+            if failed:
+                if recovery_error is None:
+                    recovery_error = RuntimeError(
+                        f"SFT prefetch recovery failed on a peer TP rank for rollout_id={rollout_id}."
+                    )
+                break
+            if missing == 0:
+                break
+
+            if got:
+                split_attempt += 1
+                if split_attempt > max_retries:
+                    recovery_error = RuntimeError(
+                        f"[sft-prepack] rollout={rollout_id}: TP ranks still split after {max_retries} "
+                        f"foreground retries ({got}/{got + missing} ranks have data)."
+                    )
+                    continue
+                if not has_window:
+                    logger.warning(
+                        "[sft-prepack] rollout=%d: %d/%d TP ranks have data, foreground re-fetch attempt %d",
+                        rollout_id,
+                        got,
+                        got + missing,
+                        split_attempt,
+                    )
+                retry_sleep_s = 0.25
+            else:
+                empty_attempt += 1
+                if empty_attempt % 100 == 0 and not has_window:
+                    logger.info(
+                        "[sft-prepack] rollout=%d waiting for complete balanced shard; attempts=%d",
+                        rollout_id,
+                        empty_attempt,
+                    )
+                retry_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
+
+            if not has_window:
+                time.sleep(retry_sleep_s)
+                try:
+                    window = self._fetch_sft_prepack_window_once(task_name, rollout_id, data_fields)
+                except BaseException as exc:  # noqa: BLE001
+                    recovery_error = exc
+
+        recovery_error_flag = torch.tensor([1 if recovery_error is not None else 0], dtype=torch.int, device=device)
+        dist.all_reduce(recovery_error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+        if int(recovery_error_flag.item()) != 0:
+            if recovery_error is not None:
+                raise recovery_error
+            raise RuntimeError(
+                f"SFT prefetch recovery failed on a peer DP rank for rollout_id={rollout_id}; "
+                "aborting to avoid a distributed hang."
+            )
+
+        assert window is not None
+        return window
+
+    def _fetch_and_prepack_sft_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> PrefetchedSFTWindow:
+        """Fetch, fully pack, pin, and enqueue H2D for one SFT window."""
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        window = None
+        fetch_attempt = 0
+        while window is None and fetch_attempt <= Envs.RELAX_FETCH_SPLIT_MAX_RETRIES:
+            window = self._fetch_sft_prepack_window_once(task_name, rollout_id, data_fields)
+            if window is None:
+                fetch_attempt += 1
+                time.sleep(Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0)
+        if window is None:
+            raise _SFTPrefetchMiss(
+                f"SFT prefetch rollout={rollout_id} dp={dp_rank} found no data after "
+                f"{fetch_attempt} rank-local attempts."
+            )
+        return window
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
@@ -782,12 +2034,26 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_actor(
+        self,
+        rollout_id: int,
+        rollout_data: RolloutBatch,
+        prepared_data_iterator: list[_SFTPrepackedDeviceIterator] | None = None,
+        prepared_num_microbatches: list[int] | None = None,
+    ) -> None:
+        resident_overlap = self._resident_sft_overlap_enabled()
+        if is_preference_mode(self.args):
+            rollout_data = expand_preference_rollout_data(rollout_data)
+
+        use_indexer_replay = getattr(self.args, "use_rollout_indexer_replay", False)
+        if use_indexer_replay:
+            from relax.utils.training.indexer_replay import IndexerReplay
+
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
         # rest of the pipeline can assume same-device inputs.
-        if self.args.advantage_estimator == "ppo":
+        if algorithm_needs_critic(self.args):
             cur_device = torch.cuda.current_device()
             for key in ("values", "loss_masks"):
                 tensors = rollout_data.get(key)
@@ -798,9 +2064,23 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
 
         # Create data iterator for actor forward + routing replay + train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        uses_prepared_sft_window = prepared_data_iterator is not None and prepared_num_microbatches is not None
+        if not uses_prepared_sft_window:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        else:
+            data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
+        inline_old_log_probs = hasattr(self, "weights_backuper") and can_reuse_colocate_log_probs(
+            self.args,
+            num_microbatches,
+            backup_tags=self.weights_backuper.backup_tags,
+            rollout_data_postprocess=self.rollout_data_postprocess,
+        )
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
-        if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
+        if (
+            not is_offline_mode(self.args)
+            and self.args.use_dynamic_batch_size
+            and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu
+        ):
             data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
                 self.args,
                 self.model,
@@ -812,34 +2092,44 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
+        if use_indexer_replay:
+            self.fill_indexer_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
-            should_compute_old_log_probs = self.args.compute_advantages_and_returns
+            standard_dpo = self._is_standard_dpo()
+            should_compute_old_log_probs = self.args.compute_advantages_and_returns or standard_dpo
             # PPO fully_async has a standalone Advantages service that produces
             # advantages/returns via TransferQueue; every other path (including
             # PPO colocate) computes GAE inline from critic's ``values``.
             should_compute_gae_in_actor = self.args.compute_advantages_and_returns and not (
-                self.args.advantage_estimator == "ppo" and self.args.fully_async and not self.args.hybrid
+                algorithm_needs_critic(self.args) and self.args.fully_async and not self.args.hybrid
             )
 
             if should_compute_old_log_probs:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("ref")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator_logprobs,
-                            num_microbatches_logprobs,
-                            store_prefix="ref_",
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("fallthrough")
+                    try:
+                        self._switch_model("ref")
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator_logprobs,
+                                num_microbatches_logprobs,
+                                store_prefix="ref_",
+                            )
                         )
-                    )
+                    finally:
+                        self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
 
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("fallthrough")
                     self._switch_model("teacher")
                     rollout_data.update(
                         self.compute_log_prob(
@@ -851,12 +2141,18 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if (
+                    not standard_dpo
+                    and not inline_old_log_probs
+                    and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics)
+                ):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("replay_forward")
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -867,6 +2163,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
+                    if use_indexer_replay:
+                        IndexerReplay.reset_forward()
 
                 # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
@@ -877,7 +2175,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     raise RuntimeError("Actor training with critic requires 'values' in rollout data.")
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                capture_hooks.begin_rollout_for(self.args, rollout_id)
+                try:
+                    compute_advantages_and_returns(self.args, rollout_data, inline_log_probs=inline_old_log_probs)
+                    capture_hooks.capture_rollout_advantage(rollout_data=rollout_data, args=self.args)
+                finally:
+                    capture_hooks.end_rollout_for()
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -887,15 +2190,24 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            if use_indexer_replay:
+                IndexerReplay.set_stage("replay_backward")
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                )
+                try:
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                    )
+                    self._resident_sft_params_pending = resident_overlap and rollout_id + 1 < self.args.num_rollout
+                finally:
+                    for iterator in data_iterator:
+                        close = getattr(iterator, "close", None)
+                        if close is not None:
+                            close()
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -905,14 +2217,17 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
+        if use_indexer_replay:
+            IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        self._backup_actor_weights_after_train()
 
         # Update ref model if needed
         if (
             self.args.ref_update_interval is not None
             and (rollout_id + 1) % self.args.ref_update_interval == 0
+            and hasattr(self, "weights_backuper")
             and "ref" in self.weights_backuper.backup_tags
         ):
             with timer("ref_model_update"):
@@ -941,14 +2256,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_response_token_counts = sum(all_response_token_counts, [])  # flatten
         Timer().response_lens = all_response_token_counts
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
@@ -970,11 +2289,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             if has_rollout:
                 self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        with timer("train_metrics_flush"):
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id)
+        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here
@@ -1132,20 +2452,18 @@ class MegatronTrainRayActor(TrainRayActor):
                     RoutingReplay.clear_all_forward()
 
     @staticmethod
-    def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
-        """Split a merged rollout batch (dict of per-sample lists) into at most
-        ``num_chunks`` roughly equal sub-batches along the sample dimension.
+    def _split_rollout_batch(rollout_data: RolloutBatch, sample_counts: list[int]) -> List[RolloutBatch]:
+        """Split a merged rollout batch along explicit sample boundaries.
 
         Keys whose value is not a per-sample list are copied into every chunk
         unchanged. Used by the debug_train_only path to feed the collected-
         sub-batch forward loop (one global batch per chunk).
         """
         num_samples = len(rollout_data["tokens"])
-        num_chunks = max(1, min(num_chunks, num_samples))
-        chunk_size = (num_samples + num_chunks - 1) // num_chunks
         chunks: List[RolloutBatch] = []
-        for start in range(0, num_samples, chunk_size):
-            end = min(start + chunk_size, num_samples)
+        start = 0
+        for sample_count in sample_counts:
+            end = start + sample_count
             chunk: RolloutBatch = {}
             for key, value in rollout_data.items():
                 if isinstance(value, list) and len(value) == num_samples:
@@ -1153,6 +2471,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     chunk[key] = value
             chunks.append(chunk)
+            start = end
         return chunks
 
     def _use_streaming_fwd(self) -> bool:
@@ -1224,6 +2543,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @manual_gc_training
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -1246,6 +2566,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
         rollout_mini_local_sample_counts: list[int] = []
+
+        def mark_rollout_mini_boundary(sub_batch: RolloutBatch) -> None:
+            sub_batch[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [len(sub_batch["total_lengths"])]
+
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1256,12 +2580,13 @@ class MegatronTrainRayActor(TrainRayActor):
             full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
             debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, debug_data)
-            for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
-                        f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
-                    )
+            debug_mini_row_counts = _rollout_mini_row_counts(
+                debug_data["sample_indices"],
+                plan.mini_local_sample_request,
+                plan.num_rollout_minis,
+            )
+            for sub_batch in self._split_rollout_batch(debug_data, debug_mini_row_counts):
+                mark_rollout_mini_boundary(sub_batch)
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
@@ -1275,7 +2600,7 @@ class MegatronTrainRayActor(TrainRayActor):
             loop_start = time.monotonic()
             last_progress = loop_start
             last_warn = loop_start
-            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
+            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id, streaming=True):
                 data_fields = [
                     "tokens",
                     "total_lengths",
@@ -1283,9 +2608,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     "loss_masks",
                     "rollout_log_probs",
                     "rewards",
-                    "raw_reward",
+                    "sample_indices",
+                    "sample_index_mask_sums",
+                    "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
+                if self.args.advantage_estimator == "score_centering":
+                    data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
@@ -1313,12 +2642,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 batch_index += 1
 
                 # Forward passes on this sub-batch (small memory footprint)
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
-                        f"batch_index={batch_index - 1}: expected {batch_size}, "
-                        f"got {len(sub_batch['total_lengths'])}."
-                    )
+                mark_rollout_mini_boundary(sub_batch)
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
@@ -1398,14 +2722,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
@@ -1443,7 +2771,10 @@ class MegatronTrainRayActor(TrainRayActor):
         self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
+        self._run_step_evaluation(
+            evaluation_step_for_rollout(self.args, rollout_id),
+            end_update_weight=True,
+        )
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1452,6 +2783,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @manual_gc_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -1466,10 +2798,14 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "rollout_log_probs",
             "rewards",
-            "raw_reward",
+            "sample_indices",
+            "sample_index_mask_sums",
+            "group_index",
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
+        if self.args.advantage_estimator == "score_centering":
+            data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
@@ -1506,6 +2842,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.num_microbatches,
                 )
             self.prof.step(rollout_id=rollout_id)
+            # [perf] Time actor spent waiting for TQ data (starvation).
+            # Unlike tgd_fetch (per-RPC duration), this is the full wait window per mb.
+            _stream_iters = [it for it in self.data_iterator if isinstance(it, StreamingTQIterator)]
+            if _stream_iters:
+                Timer().add("actor_train_stream_wait", sum(sum(it.tq_wait_times) for it in _stream_iters))
             if len(self.data_iterator) > 1 and all(
                 isinstance(iterator, StreamingTQIterator) for iterator in self.data_iterator
             ):
@@ -1526,7 +2867,10 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_only, actor_fwd_only = self._check_services_health()
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
+            self._run_step_evaluation(
+                evaluation_step_for_rollout(self.args, rollout_id),
+                end_update_weight=True,
+            )
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the
@@ -1556,14 +2900,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_response_token_counts = sum(all_response_token_counts, [])  # flatten
         Timer().response_lens = all_response_token_counts
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
@@ -1577,6 +2925,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
+        self._flush_resident_sft_parameters()
 
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
@@ -1588,16 +2937,43 @@ class MegatronTrainRayActor(TrainRayActor):
             from megatron.training.async_utils import maybe_finalize_async_save
 
             maybe_finalize_async_save(blocking=True)
-
-        if dist.get_rank() == 0:
-            rotate_ckpt(self.args, global_step=rollout_id)
+            if not self._is_standard_dpo() and dist.get_rank(group=get_gloo_group()) == 0:
+                # Only Megatron's successful finalizer advances this tracker.
+                tracker_path = os.path.join(self.args.save, "latest_checkpointed_iteration.txt")
+                if os.path.isfile(tracker_path):
+                    with open(tracker_path, encoding="utf-8") as tracker:
+                        completed_step = tracker.read().strip()
+                    if completed_step.isdigit() and int(completed_step) < rollout_id:
+                        rotate_ckpt(self.args, global_step=int(completed_step))
 
         dist.barrier(group=get_gloo_group())
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        save(
+            rollout_id,
+            self.model,
+            self.optimizer,
+            self.opt_param_scheduler,
+            lora_only=self.role == "actor" and getattr(self.args, "save_lora_only", False),
+        )
 
-        if force_sync and self.args.async_save:
+        if (force_sync or self._is_standard_dpo()) and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
+
+        if self._is_standard_dpo():
+            identity = self._dpo_reference_identity
+            if identity is None:
+                raise RuntimeError("cannot save standard DPO without a validated reference identity")
+            if dist.get_rank(group=get_gloo_group()) == 0:
+                write_reference_identity(reference_identity_path(self.args.save, rollout_id), identity)
+            # Functional barrier (not debugging): peers must not proceed past
+            # the checkpoint before rank 0's identity sidecar is durable,
+            # otherwise a concurrent resume could miss the file.
+            dist.barrier(group=get_gloo_group())
+        # Async saves commit at finalization, not when save() returns. Keep
+        # the previous recovery point until then, including DPO's sidecar.
+        if not self.args.async_save or force_sync or self._is_standard_dpo():
+            if dist.get_rank(group=get_gloo_group()) == 0:
+                rotate_ckpt(self.args, global_step=rollout_id)
 
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
@@ -1611,6 +2987,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+        self._flush_resident_sft_parameters()
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -1630,9 +3007,18 @@ class MegatronTrainRayActor(TrainRayActor):
             ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
-            if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.recover_rollout_engines.remote())
-            dist.barrier(group=get_gloo_group())
+            process_group = get_gloo_group()
+            recovery_error = [None]
+            if dist.get_rank(process_group) == 0:
+                try:
+                    ray.get(self.rollout_manager.recover_rollout_engines.remote())
+                except Exception as error:
+                    recovery_error[0] = f"{type(error).__name__}: {error}"
+            # Propagate failure before any rank starts weight sync. A rank-0
+            # exception must not leave its peers waiting at a barrier.
+            dist.broadcast_object_list(recovery_error, src=0, group=process_group)
+            if recovery_error[0] is not None:
+                raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()
@@ -1646,7 +3032,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            reload_process_groups(
+                timeout_minutes=self.args.distributed_timeout_minutes,
+                process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
+            )
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
@@ -1687,6 +3076,10 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             destroy_process_groups()
 
+        if self.args.offload_rollout:
+            # Wait for every trainer to release update buffers before restoring KV/GenRM.
+            dist.barrier(group=get_gloo_group())
+
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
@@ -1699,7 +3092,8 @@ class MegatronTrainRayActor(TrainRayActor):
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
             if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
-                post_sync_handles.append(self.genrm_manager.onload.remote())
+                # A list of one or more GenRM manager handles (one per instance).
+                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
 
@@ -1718,22 +3112,39 @@ class MegatronTrainRayActor(TrainRayActor):
         # Default: both services healthy → update both
         rollout_only = False
         actor_fwd_only = False
+        process_group = get_gloo_group()
 
         # When true_on_policy_mode is enabled, actor_fwd is intentionally absent
         # (its log_probs are recomputed inline by the train forward). Force
         # rollout-only weight update and skip the actor_fwd HTTP probe.
         actor_fwd_absent = getattr(self.args, "true_on_policy_mode", False)
 
-        if dist.get_rank() == 0:
+        if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                retry_deadline = None
                 while True:
+                    request_timeout = self.args.rollout_http_timeout
+                    if retry_deadline is not None:
+                        request_timeout = retry_deadline - time.monotonic()
+                        if request_timeout <= 0:
+                            raise requests.exceptions.Timeout("elastic scale-in fence did not clear")
                     response = requests.get(
                         f"{rollout_serve_url}/can_do_update_weight_for_async",
-                        timeout=self.args.rollout_http_timeout,
+                        timeout=request_timeout,
                     )
+                    if getattr(response, "status_code", 200) == 503:
+                        if retry_deadline is None:
+                            retry_deadline = time.monotonic() + max(float(self.args.rollout_http_timeout), 1.0)
+                        logger.warning("Elastic scale-in is draining; retrying before weight update.")
+                        time.sleep(min(1.0, max(0.0, retry_deadline - time.monotonic())))
+                        continue
                     response.raise_for_status()
+                    # A successful non-503 response means the scale-in fence
+                    # has cleared. Do not let an earlier draining deadline
+                    # bound the normal readiness polling below.
+                    retry_deadline = None
                     res = response.json()
                     if res:
                         response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
@@ -1773,7 +3184,7 @@ class MegatronTrainRayActor(TrainRayActor):
             dtype=torch.int32,
             device="cpu",
         )
-        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=process_group)
         rollout_only = bool(flags[0].item())
         actor_fwd_only = bool(flags[1].item())
 
@@ -1836,7 +3247,19 @@ class MegatronTrainRayActor(TrainRayActor):
         try:
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
-            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            synced_actor_ids = run(
+                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
+            )
+            if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
+                try:
+                    ray.get(
+                        self.rollout_manager.register_recovered_engines.remote(synced_actor_ids),
+                        timeout=self.args.rollout_http_timeout,
+                    )
+                except Exception:
+                    # Publication is unconfirmed; retry after the next successful
+                    # sync without stranding other ranks at their barrier.
+                    logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
@@ -1852,30 +3275,31 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
-        self.args.load = path
-        self.args.no_load_optim = True
-        self.args.no_load_rng = True
-        self.args.finetune = True
-
         old_ckpt_step = None
-        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.ref_ckpt_step
-        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
+        try:
+            self.args.load = path
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
 
-        _, _ = load_checkpoint(
-            self.model,
-            None,
-            None,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
-        )
-        self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.ref_ckpt_step
+            elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.opd_teacher_ckpt_step
 
-        if old_ckpt_step is not None:
-            self.args.ckpt_step = old_ckpt_step
+            _, _ = load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if old_ckpt_step is not None:
+                self.args.ckpt_step = old_ckpt_step
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
@@ -2125,8 +3549,138 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches = [k_global]
         return data_iterator, num_microbatches
 
+    def _start_sft_train_prefetch(
+        self, rollout_id: int, task_name: str, data_fields: list[str], batch_size: int
+    ) -> None:
+        """Start a CPU-only TQ read for the next SFT step while this one
+        trains."""
+        if self._sft_train_prefetch_executor is None:
+            return
+        if rollout_id + 1 >= self.args.num_rollout:
+            self._shutdown_sft_train_prefetch()
+            return
+        if _should_pause_sft_lookahead(self.args, rollout_id):
+            return
+        if self._sft_train_prefetch is not None:
+            raise RuntimeError("SFT train-data prefetch was not consumed before scheduling the next step.")
+
+        next_rollout_id = rollout_id + 1
+        partition_id = sft_partition_id(self.args, next_rollout_id)
+        sampling_config = {
+            "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+            "task_name": task_name,
+        }
+        cancel_event = Event()
+        self._sft_train_prefetch_cancel = cancel_event
+        self._sft_train_prefetch_rollout_id = next_rollout_id
+        if getattr(self, "_sft_image_preprocess_on_rank", False):
+            # The TQ payload carries image references instead of pixels; the
+            # same background worker continues with the file read + pixel
+            # rebuild so the CPU tensors are ready before step N+1 starts.
+            self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
+                self._sft_image_prefetch.fetch,
+                next_rollout_id,
+                model=self.model,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                cancel_event=cancel_event,
+            )
+        else:
+            self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
+                _prefetch_data_from_transfer_queue,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                cancel_event=cancel_event,
+                batch_index=0,
+            )
+        if is_megatron_main_rank():
+            logger.info("Started CPU-only TQ prefetch for SFT rollout_id=%d", next_rollout_id)
+
+    def _take_sft_train_prefetch(self, rollout_id: int) -> tuple[list, float] | None:
+        """Return the matching raw payload after replica-wide status
+        agreement."""
+        if self._sft_train_prefetch_executor is None:
+            return None
+        future = self._sft_train_prefetch
+        prefetched_rollout_id = self._sft_train_prefetch_rollout_id
+        cancel_event = self._sft_train_prefetch_cancel
+        self._sft_train_prefetch_cancel = None
+        self._sft_train_prefetch = None
+        self._sft_train_prefetch_rollout_id = None
+        prefetched_fetch = None
+        local_error: BaseException | None = None
+        fatal = False
+
+        if future is not None and prefetched_rollout_id != rollout_id:
+            if cancel_event is not None:
+                cancel_event.set()
+            logger.warning(
+                "Discarding stale SFT train-data prefetch: prefetched rollout_id=%s, requested=%s.",
+                prefetched_rollout_id,
+                rollout_id,
+            )
+            if future.done():
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Discarded SFT train-data prefetch also failed: %s", exc)
+                if getattr(self, "_sft_image_prefetch", None) is not None:
+                    self._sft_image_prefetch.discard(prefetched_rollout_id)
+            elif not future.cancel():
+                fatal = True
+                local_error = RuntimeError(
+                    f"Cannot cancel stale SFT train-data prefetch for rollout_id={prefetched_rollout_id}; "
+                    f"requested rollout_id={rollout_id}."
+                )
+        elif future is not None:
+            with timer("sft_train_prefetch_wait"):
+                try:
+                    prefetched_fetch = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    local_error = exc
+
+        agreed_fetch = _agree_sft_train_prefetch_result(prefetched_fetch, local_error, fatal=fatal)
+        if agreed_fetch is None and local_error is not None and not fatal:
+            logger.warning("SFT train-data prefetch failed for rollout_id=%d: %s", rollout_id, local_error)
+        return agreed_fetch
+
+    def _shutdown_sft_train_prefetch(self) -> None:
+        """Release the optional raw-prefetch slot, image worker and executor
+        once."""
+        future = self._sft_train_prefetch
+        executor = self._sft_train_prefetch_executor
+        image_prefetch = getattr(self, "_sft_image_prefetch", None)
+        cancel_event = self._sft_train_prefetch_cancel
+        self._sft_train_prefetch_cancel = None
+        self._sft_train_prefetch = None
+        self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_executor = None
+        if cancel_event is not None:
+            cancel_event.set()
+        if future is not None:
+            future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        if image_prefetch is not None:
+            image_prefetch.close()
+
     def _get_data_from_transfer_queue(
-        self, task_name, rollout_id, data_fields, batch_size, batch_index, partition_id: str | None = None
+        self,
+        task_name,
+        rollout_id,
+        data_fields,
+        batch_size,
+        batch_index,
+        partition_id: str | None = None,
+        prefetched_fetch: tuple[list, float] | None = None,
+        wholepack_training: bool = False,
     ):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
@@ -2150,10 +3704,18 @@ class MegatronTrainRayActor(TrainRayActor):
         # rank-0 pickle + one TP/PP broadcast.  Cross-rank consistency relies
         # on every model-parallel rank presenting the same logical
         # ``dp_rank``/``batch_index`` to the TQ sampler, so sampler replay
-        # returns byte-identical sample ids regardless of PP/TP world size. The only
-        # remaining incompatibility is ``rollout_routed_experts`` — it relies on
-        # the NestedTensor jagged bcast path that this mode bypasses.
+        # returns byte-identical sample ids regardless of PP/TP world size.
+        # replay tensors rely on the NestedTensor jagged broadcast path
+        # that per-rank fetch bypasses.
         per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
+        if getattr(self.args, "use_rollout_indexer_replay", False):
+            per_rank_fetch = per_rank_fetch and "rollout_indexer_topk" not in data_fields
+        prefetched_rollout_data = None
+        prefetched_fetch_time_s = None
+        if prefetched_fetch is not None:
+            if not per_rank_fetch:
+                raise RuntimeError("SFT train-data prefetch requires an active per-rank fetch path.")
+            prefetched_rollout_data, prefetched_fetch_time_s = prefetched_fetch
         rollout_data, batch_meta = get_data_from_transfer_queue(
             self.args,
             self.data_system_client,
@@ -2165,7 +3727,44 @@ class MegatronTrainRayActor(TrainRayActor):
             batch_index,
             broadcast_pp=broadcast_pp,
             per_rank_fetch=per_rank_fetch,
+            prefetched_rollout_data=prefetched_rollout_data,
+            prefetched_fetch_time_s=prefetched_fetch_time_s,
         )
+        if wholepack_training:
+            from relax.utils.data.wholepack import agree, await_batch, restore_checked
+
+            def retry_fetch():
+                return get_data_from_transfer_queue(
+                    self.args,
+                    self.data_system_client,
+                    data_fields,
+                    batch_size,
+                    partition_id,
+                    task_name,
+                    sampling_config,
+                    batch_index,
+                    broadcast_pp=broadcast_pp,
+                    per_rank_fetch=per_rank_fetch,
+                )
+
+            rollout_data, batch_meta = await_batch(
+                (rollout_data, batch_meta),
+                retry_fetch,
+                agree,
+                timeout_seconds=self.args.sft_tq_timeout_minutes * 60,
+                poll_seconds=Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0,
+            )
+            if rollout_data is not None:
+                restore_checked(self.args, batch_meta, rollout_data, agree)
+        if self._sft_image_preprocess_on_rank:
+            # Swap image-ref descriptors for the CPU pixel tensors rebuilt by
+            # the prefetch worker (or synchronously on paused/eval steps),
+            # keeping the get_batch entry format identical to the pixel path.
+            # ``resolve`` logs only when it actually attached pixels, i.e. on the
+            # vision ranks — ``is_megatron_main_rank`` is the last PP stage and
+            # never owns vision, so it would hide the rebuild entirely.
+            if not self._sft_image_prefetch.resolve_across_ranks(rollout_data, rollout_id, model=self.model, log=True):
+                rollout_data = None
 
         return rollout_data, batch_meta
 
@@ -2246,7 +3845,7 @@ class MegatronTrainRayActor(TrainRayActor):
             run(self.data_system_client.async_put(data=output_dict, metadata=batch_meta))
 
     def _put_critic_values_to_transfer_queue(self, rollout_data: RolloutBatch) -> None:
-        if getattr(self.args, "advantage_estimator", None) != "ppo":
+        if not algorithm_needs_critic(self.args):
             return
 
         values = rollout_data.get("values")

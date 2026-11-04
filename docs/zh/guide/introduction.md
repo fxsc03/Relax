@@ -2,7 +2,7 @@
 
 ## 什么是 Relax？
 
-**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是一个面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-infra/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
+**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是一个面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-studio/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
 
 ---
 
@@ -26,7 +26,7 @@ Relax 采用面向服务的六层架构设计，所有角色均部署为独立�
 
 ### ⚡ 基于 TransferQueue 的全异步训练（Fully Async）
 
-开源地址 [TransferQueue](https://github.com/redai-infra/TransferQueue)，详细介绍见 [全异步训练](./fully-async-training.md)。
+开源地址 [TransferQueue](https://github.com/redai-studio/TransferQueue)，详细介绍见 [全异步训练](./fully-async-training.md)。
 
 在全异步模式下，Rollout（推理）、Actor（训练）、ActorFwd（前向计算）、Reference（参考模型）和 Advantages（优势计算）五个角色运行在**独立的 GPU 集群**上，通过 TransferQueue 交换数据，通过 DCS（Distributed Checkpoint Service）异步同步权重。
 
@@ -59,6 +59,28 @@ Relax 支持在训练过程中通过 HTTP REST API **动态调整 Rollout 引擎
 - **灵活的终止条件**：支持 `max_turns`（最大交互轮数）、token budget（可用 token 预算耗尽即截断）、`env done`（环境返回任务完成）三种终止机制的组合
 - **典型应用**：DeepEyes 任务——使用 Qwen3-VL-30B-A3B 进行 Agentic Multi-Turn GRPO Training
 
+
+## 模型配置与示例
+
+以下列出仓库中已有配置或接入实现的模型。各模型的训练模式与限制以链接中的脚本和指南为准；模型配置统一放在 [`scripts/models/`](../../../scripts/models/)。
+
+| 模型 | 范围 | 配置 / 指南 |
+|---|---|---|
+| Qwen2.5 | 文本 | [7B](../../../scripts/models/qwen25-7B.sh) |
+| Qwen3 | 文本 | [0.6B](../../../scripts/models/qwen3-0.6B.sh), [1.7B](../../../scripts/models/qwen3-1.7B.sh), [4B](../../../scripts/models/qwen3-4B.sh), [8B](../../../scripts/models/qwen3-8B.sh), [32B](../../../scripts/models/qwen3-32B.sh), [30B-A3B](../../../scripts/models/qwen3-30B-A3B.sh) |
+| GLM4.7 | 文本 | [30B-A3B](../../../scripts/models/glm4.7-30B-A3B.sh) |
+| GLM5 | 文本 | [744B-A40B](../../../scripts/models/glm5-744B-A40B.sh) |
+| DeepSeek-V4-Flash | 文本 | [Flash](../../../scripts/models/deepseek-v4-flash.sh) |
+| Gemma4 | 文本训练示例 | [26B-A4B](../../../scripts/models/gemma4-26B.sh), [31B](../../../scripts/models/gemma4-31B.sh) |
+| Qwen3-VL | 视觉 + 语言 | [2B](../../../scripts/models/qwen3-vl-2B.sh), [4B](../../../scripts/models/qwen3-vl-4B.sh), [8B](../../../scripts/models/qwen3-vl-8B.sh), [30B-A3B](../../../scripts/models/qwen3-vl-30B-A3B.sh) |
+| Qwen3.5 | 视觉 + 语言 | [4B](../../../scripts/models/qwen35-4B.sh), [9B](../../../scripts/models/qwen35-9B.sh), [27B](../../../scripts/models/qwen35-27B.sh), [35B-A3B](../../../scripts/models/qwen35-35B-A3B.sh), [122B-A10B](../../../scripts/models/qwen35-122B-A10B.sh), [397B-A17B](../../../scripts/models/qwen35-397B-A17B.sh) |
+| Qwen3.6 | 视觉 + 语言 | [27B](../../../scripts/models/qwen36-27B.sh), [35B-A3B](../../../scripts/models/qwen36-35B-A3B.sh) |
+| Qwen3.8 | 视觉 + 语言 | [27B](../../../scripts/models/qwen38-27B.sh) |
+| Kimi K2.6 | 视觉 + 语言 | [K2.6](../../../scripts/models/kimi-k2.6.sh) |
+| Kimi K3 | 多模态全参 / LoRA SFT 与导出 | [K3](../../../scripts/models/kimi-k3.sh) · [训练与导出指南](../../../examples/models/kimi-k3/README.zh-CN.md) |
+| dots.mocr | OCR / 文档理解 | [3B](../../../scripts/models/dotsocr2.sh) |
+| Qwen3-Omni | 文本 + 视觉 + 音频 | [30B-A3B](../../../scripts/models/qwen3-omni-30B-A3B.sh) |
+| Qwen-Image | 文生图扩散模型 RL | [训练指南](./diffusion-generative-rl.md) |
 
 ## 项目结构
 

@@ -1,9 +1,26 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 import numpy as np
 import torch
+
+
+_SPEC_TOKEN_COUNT_KEYS = (
+    ("spec_num_correct_drafts", "spec_num_proposed_drafts"),
+    ("spec_accepted_drafts", "spec_proposed_drafts"),
+    ("spec_accept_token_num", "spec_draft_token_num"),
+)
+
+
+def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
+    """Extract speculative decoding counts across SGLang metadata versions."""
+    for accept_key, draft_key in _SPEC_TOKEN_COUNT_KEYS:
+        if accept_key in meta_info and draft_key in meta_info:
+            return int(meta_info.get(accept_key, 0) or 0), int(meta_info.get(draft_key, 0) or 0)
+    return 0, 0
 
 
 @dataclass
@@ -27,7 +44,9 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
-    rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
+    rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
+    rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
+    rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
 
@@ -47,10 +66,9 @@ class Sample:
     teacher_prompt: str | list[dict[str, str]] | None = None
     teacher_multimodal_inputs: dict[str, Any] | None = None
     teacher_tokens: list[int] | None = None  # expanded teacher_prompt_tokens + response_tokens
+    teacher_rollout_tokens: list[int] | None = None  # collapsed teacher prompt + the same response tokens
     teacher_prompt_length: int | None = None  # number of teacher prompt tokens in teacher_tokens (expanded)
     teacher_image_data: dict[str, list] | None = None  # base64-encoded teacher media for SGLang payload
-    teacher_image_b64_list: list[str] | None = None  # raw base64-PNG list for OPD pre-expanded teacher path
-    teacher_image_grid_thw: Any = None  # HF processor image_grid_thw, [[t, h, w], ...]
 
     class Status(Enum):
         PENDING = "pending"
@@ -90,8 +108,9 @@ class Sample:
             return self.completion_token_num / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
         def add(self, meta_info: dict):
-            self.spec_accept_token_num += meta_info.get("spec_accept_token_num", 0)
-            self.spec_draft_token_num += meta_info.get("spec_draft_token_num", 0)
+            spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
+            self.spec_accept_token_num += spec_accept_token_num
+            self.spec_draft_token_num += spec_draft_token_num
             self.spec_verify_ct += meta_info.get("spec_verify_ct", 0)
             self.completion_token_num += meta_info.get("completion_tokens", 0)
 

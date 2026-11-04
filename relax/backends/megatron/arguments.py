@@ -2,6 +2,8 @@
 
 import ast
 import math
+from argparse import Namespace
+from typing import Optional
 
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.arguments import parse_args as _megatron_parse_args
@@ -17,6 +19,7 @@ from transformers import AutoConfig
 
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import ModelSource
 
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
@@ -126,6 +129,45 @@ def _validate_dynamic_context_parallel(args):
     args.max_seqlen_per_dp_cp_rank = args.max_tokens_per_gpu
 
 
+def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -> None:
+    """Validate the mode name, then GDN-specific flags once the model is known.
+
+    Geometry-dependent rejections (e.g. explicit `headwise` on heads not
+    divisible by `tp*max_cp`) can only be checked once the real GDN head counts
+    are known, which happens in MCore's `TransformerConfig.__post_init__` gate
+    -- not here. Bridge calls this again with the provider's actual config.
+    """
+    model_config = config if config is not None else args
+    mode = getattr(model_config, "linear_cp_mode", "chunkwise")
+    allowed_modes = {"headwise", "chunkwise", "all_gather"}
+    if mode not in allowed_modes:
+        raise ValueError(
+            f"--linear-cp-mode must be one of {sorted(allowed_modes)!r}; got {mode!r}. Resolve 'auto' before construction."
+        )
+
+    # Bridge determines the attention variant from the HF checkpoint. The default
+    # linear_cp_mode on an ordinary-attention model does not make it a GDN model.
+    if getattr(model_config, "experimental_attention_variant", None) not in {"gated_delta_net", "gdn"}:
+        return
+
+    cp_may_exceed_one = (
+        getattr(args, "dynamic_context_parallel", False) or getattr(model_config, "context_parallel_size", 1) > 1
+    )
+    if cp_may_exceed_one and getattr(args, "allgather_cp", False):
+        raise ValueError(
+            "GDN CP requires zig-zag THD packing in every linear_cp_mode; --allgather-cp uses "
+            "contiguous per-rank packing and is incompatible with GDN CP>1. --allgather-cp is a "
+            "data/attention packing flag, separate from --linear-cp-mode=all_gather."
+        )
+
+    if mode == "chunkwise" and cp_may_exceed_one and getattr(model_config, "deterministic_mode", False):
+        raise ValueError(
+            "--linear-cp-mode=chunkwise does not support --deterministic-mode while CP>1 may occur: "
+            "the deterministic torch reference path only accepts cp_context=None. "
+            "Packed GDN inputs also do not support deterministic mode in the other CP modes."
+        )
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
@@ -172,6 +214,8 @@ def validate_args(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
+
+    _validate_linear_cp_mode(args)
     return args
 
 
@@ -262,8 +306,8 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    # Megatron DistributedOptimizer supports Adam, but not SGD.
+    args.use_distributed_optimizer = getattr(args, "optimizer", "adam") != "sgd"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     _resolve_optimizer_precision_args(args)
@@ -349,9 +393,19 @@ def _derive_cluster_args_from_resource(args):
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 
 
-def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
+def megatron_parse_args(
+    extra_args_provider,
+    skip_hf_validate: bool = False,
+    model_source: Optional[ModelSource] = None,
+):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
+
+    if model_source is not None:
+        # Keep the CLI path so node-local materialization can remap other
+        # arguments that explicitly referenced the same model.
+        args._model_source_original_hf_checkpoint = args.hf_checkpoint
+        args.hf_checkpoint = model_source.uri
 
     if args.hf_checkpoint and not skip_hf_validate:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)

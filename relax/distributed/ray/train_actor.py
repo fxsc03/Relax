@@ -3,6 +3,7 @@
 import abc
 import os
 import random
+import threading
 from datetime import timedelta
 
 import ray
@@ -12,7 +13,7 @@ import torch.distributed as dist
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
-from relax.utils.device import ray_get_device_ids
+from relax.utils.device import device_module, ray_get_device_ids
 from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -63,7 +64,7 @@ class TrainRayActor(RayActor):
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
         local_rank = Envs.LOCAL_RANK
-        device_utils.set_device(f"{device_utils.get_device_name()}:{local_rank}")
+        device_module.set_device(f"{device_utils.get_device_name()}:{local_rank}")
 
         backend = args.distributed_backend
 
@@ -78,6 +79,15 @@ class TrainRayActor(RayActor):
 
         numa_local_rank = Envs.RANK % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
+
+    def termination_probe(self) -> None:
+        """Never return normally; used to confirm force-killed actor exit.
+
+        The driver queues this behind ``init`` before calling ``ray.kill``. Its
+        ObjectRef must become terminal with ``RayActorError``; a successful
+        return would mean the actor survived cleanup and is unsafe to reuse.
+        """
+        threading.Event().wait()
 
     def clear_memory(self):
         print_memory("before TrainRayActor.clear_memory")

@@ -1,10 +1,15 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import logging
 import math
+from collections import Counter
 from typing import Any, Literal
 
 import numpy as np
 import torch
 
+from relax.algorithms.spec import get_algorithm
+from relax.utils.repetition import detect_repetition
 from relax.utils.types import Sample
 
 
@@ -88,6 +93,51 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
     }
 
 
+def compute_rollout_stop_reason_and_turn_metrics(
+    samples: list[Sample],
+) -> dict[str, int | float]:
+    """Aggregate rollout stop reasons and turn-count statistics."""
+    if not samples:
+        return {}
+
+    stop_reasons = []
+    turns = []
+
+    for sample in samples:
+        reason = sample.metadata.get("rollout_stop_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = sample.metadata.get("stop_reason")
+            if isinstance(reason, str) and reason.strip():
+                reason = reason.strip().split(":", 1)[0]
+        if not isinstance(reason, str) or not reason.strip():
+            reason = "unknown"
+        else:
+            reason = reason.strip()
+
+        stop_reasons.append(reason)
+        turns.append(sample.metadata.get("rollout_turns", 1))
+
+    metrics: dict[str, int | float] = {}
+    num_samples = len(samples)
+
+    for reason, count in sorted(Counter(stop_reasons).items()):
+        prefix = f"stop_reason/{reason}/"
+        metrics[f"{prefix}count"] = count
+        metrics[f"{prefix}ratio"] = count / num_samples
+
+    metrics["num_turn/min"] = np.min(turns).item()
+    metrics["num_turn/mean"] = np.mean(turns).item()
+    metrics["num_turn/max"] = np.max(turns).item()
+
+    p50, p90, p95, p99 = np.percentile(turns, [50, 90, 95, 99])
+    metrics["num_turn/p50"] = p50.item()
+    metrics["num_turn/p90"] = p90.item()
+    metrics["num_turn/p95"] = p95.item()
+    metrics["num_turn/p99"] = p99.item()
+
+    return metrics
+
+
 def is_rollout_numeric_metric_value(value) -> bool:
     return isinstance(value, (int, float, np.integer, np.floating))
 
@@ -111,7 +161,13 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
 
 
 def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
-    """Compute RLOO-specific diagnostics from training rollout samples.
+    """Compute leave-one-out diagnostics from training rollout samples.
+
+    Gated on the algorithm registry's ``reward_normalizer`` rather than on the
+    estimator's name: what makes these numbers meaningful is that the reward
+    stage produced a leave-one-out baseline, so any algorithm declaring that
+    normalizer gets them. The ``rloo/`` key prefix stays as-is -- those metric
+    names are already published to dashboards.
 
     These keys are returned with an ``rloo/`` prefix. The training rollout
     logger adds the outer ``rollout/`` prefix before publishing them.
@@ -124,7 +180,8 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     length and therefore remains distinct from a sample whose response exists
     but is fully masked.
     """
-    if getattr(args, "advantage_estimator", None) != "rloo":
+    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    if spec.reward_normalizer != "group_leave_one_out":
         return {}
     if (
         getattr(args, "custom_reward_post_process_path", None) is not None
@@ -185,12 +242,14 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     }
 
 
-def compute_rollout_explicit_reward_metrics(
+def compute_rollout_reward_metrics(
     args,
     samples: list[Sample],
     *,
     include_rloo_diagnostics: bool = True,
 ) -> dict[str, float]:
+    reward_values = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
+    log_dict = {"raw_reward": np.mean(reward_values).item()} if reward_values else {}
     reward_metric_values: dict[str, list[float]] = {}
     primary_reward_key = getattr(args, "reward_key", None)
     for sample in samples:
@@ -207,19 +266,20 @@ def compute_rollout_explicit_reward_metrics(
             ):
                 continue
             append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
-    log_dict = finalize_rollout_explicit_metric_values(reward_metric_values)
-    if args.log_passrate:
-        rewards = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
-        if rewards:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(flat_rewards=rewards, group_size=args.n_samples_per_prompt),
-                "passrate/",
-            )
+    log_dict |= finalize_rollout_explicit_metric_values(reward_metric_values)
+    if args.log_passrate and reward_values:
+        log_dict |= dict_add_prefix(
+            compute_pass_rate(flat_rewards=reward_values, group_size=args.n_samples_per_prompt),
+            "passrate/",
+        )
 
     if include_rloo_diagnostics:
         log_dict |= _compute_rloo_group_diagnostics(args, samples)
 
     return log_dict
+
+
+compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
 
 
 def compression_ratio(
@@ -266,11 +326,8 @@ def compression_ratio(
     return ratio, savings_pct
 
 
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
+def has_repetition(text: str) -> bool:
+    return detect_repetition(text, stop_after_first_hit=True).has_repetition
 
 
 def compute_rollout_step(args, rollout_id):

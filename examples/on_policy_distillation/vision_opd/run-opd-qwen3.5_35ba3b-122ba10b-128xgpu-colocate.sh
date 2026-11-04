@@ -4,7 +4,7 @@ set -ex
 set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
-export RELAX_OPD_PREEXPANDED_PATCH=1
+export SGLANG_MM_AVOID_RETOKENIZE=true
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -60,8 +60,8 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
 
    --multimodal-keys '{"image":"images"}'
-   --image-min-token-num 64                 
-   --image-max-token-num ${IMG_MAX_TOKEN:-16384}              
+   --image-min-token-num 64
+   --image-max-token-num ${IMG_MAX_TOKEN:-16384}
 
    # pure OPSD: reward is zeroed out by --opd-disable-rl-reward, but RewardWorker does not support rm_type='none';
    --rm-type random

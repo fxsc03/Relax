@@ -4,13 +4,21 @@
 
 from argparse import Namespace
 
+from relax.engine.sft.runtime import is_sft_mode
+
 
 GENRM_ROLE = "genrm"
 
 
 def register_genrm(config: Namespace, algo: dict) -> list[str]:
-    """Conditionally register GenRM into the algo dict."""
-    if getattr(config, "genrm_model_path", None) is None:
+    """Conditionally register GenRM into the algo dict.
+
+    Triggered by the normalized ``_genrm_instances_resolved`` (populated at
+    arg-parse time from either --genrm-instances or the legacy
+    --genrm-model-path), not directly by --genrm-model-path, so both single-
+    and multi-instance configs go through the same gate.
+    """
+    if not getattr(config, "_genrm_instances_resolved", None):
         return []
 
     from relax.components.genrm import GenRM
@@ -22,14 +30,13 @@ def register_genrm(config: Namespace, algo: dict) -> list[str]:
 def register_sft_rollout(config: Namespace, algo: dict) -> list:
     """Conditionally register Rollout into the SFT algo dict.
 
-    SFT mode is identified by ``loss_type == "sft"`` throughout the codebase.
-    Do not switch this to ``advantage_estimator == "sft"``: Megatron's parser
-    does not accept ``"sft"`` as an ``--advantage-estimator`` choice.
+    Only ``loss_type == "sft"`` supports generation prediction; other offline
+    objectives reuse the producer and actor roles without a Rollout service.
 
     Rollout is only spun up when ``--sft-predict-interval`` is set — that is
     the sole consumer of generative eval under SFT today.
     """
-    if getattr(config, "loss_type", None) != "sft":
+    if not is_sft_mode(config):
         return []
     if getattr(config, "sft_predict_interval", None) is None:
         return []

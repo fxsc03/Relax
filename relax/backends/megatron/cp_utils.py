@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
@@ -11,6 +13,111 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"megatron", "megatron.core"}:
         raise
     mpu = None
+
+from relax.utils.logging_utils import get_logger
+from relax.utils.reloadable_process_group import ReloadableProcessGroup
+
+
+logger = get_logger(__name__)
+
+
+def warmup_pipeline_process_group() -> None:
+    """Initialize a reloaded PP NCCL communicator before its first batched
+    P2P."""
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    if isinstance(pp_group, ReloadableProcessGroup):
+        if pp_group.group is None:
+            raise RuntimeError("PP group warmup requires a reloaded pipeline-parallel process group")
+        pp_group = pp_group.group
+    if dist.get_backend(pp_group) != "nccl":
+        return
+    dist.barrier(group=pp_group, device_ids=[torch.cuda.current_device()])
+
+
+def warmup_static_cp_forward_neighbor_p2p() -> None:
+    """Preconnect the static CP neighbors used by DSV4 CSA forward.
+
+    Relax destroys and recreates NCCL process groups between colocated phases.
+    The first DSV4 CSA forward after a wake-up then becomes the first operation
+    to exercise the CP group's neighbor P2P transports.  Run the same
+    ``irecv(left) + isend(right)`` batch once on a one-element tensor so a
+    transport setup failure is isolated to wake-up rather than a model layer.
+
+    The caller is responsible for restricting this diagnostic to DSV4 static
+    CP.  All ranks in the static CP group must call the function together.
+    """
+    cp_group = mpu.get_context_parallel_group()
+    if isinstance(cp_group, ReloadableProcessGroup):
+        if cp_group.group is None:
+            raise RuntimeError("DSV4 CP P2P warmup requires a reloaded context-parallel process group")
+        cp_group = cp_group.group
+    cp_rank = dist.get_rank(cp_group)
+    cp_size = dist.get_world_size(cp_group)
+    if cp_size <= 1:
+        raise RuntimeError("DSV4 CP P2P warmup requires context_parallel_size > 1")
+
+    global_rank = dist.get_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    device = torch.cuda.current_device()
+    send_buffer = torch.zeros(1, dtype=torch.int32, device=device)
+    recv_buffer = torch.empty_like(send_buffer)
+
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] enter global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+    dist.barrier(group=cp_group, device_ids=[device])
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] phase=forward_p2p_enter global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+
+    ops: list[dist.P2POp] = []
+    if cp_rank > 0:
+        ops.append(
+            dist.P2POp(
+                dist.irecv,
+                recv_buffer,
+                group=cp_group,
+                group_peer=cp_rank - 1,
+            )
+        )
+    if cp_rank + 1 < cp_size:
+        ops.append(
+            dist.P2POp(
+                dist.isend,
+                send_buffer,
+                group=cp_group,
+                group_peer=cp_rank + 1,
+            )
+        )
+
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] phase=forward_p2p_done global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+    dist.barrier(group=cp_group, device_ids=[device])
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] done global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
 
 
 def maybe_padded_total_lengths(
@@ -87,6 +194,41 @@ def get_logits_and_tokens_offset_with_cp(
     return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 
 
+def _slice_loss_mask_with_cp(
+    loss_mask: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    qkv_format: str,
+    max_seq_len: int | None,
+    padded_total_length: int | None,
+    dynamic_cp_size: int | None,
+    dynamic_cp_rank: int | None,
+) -> torch.Tensor:
+    """Slice a response mask in the coordinate system used by CP log-probs.
+
+    RL masks are target-token aligned, while SFT masks have already been
+    shifted to predictor coordinates by ``align_loss_mask_for_sft``. CP log-
+    probs are ordered by target token in both the zigzag and allgather-
+    redistributed paths, so SFT must slice its mask with the matching
+    predictor/logit offsets.
+    """
+    prompt_length = total_length - response_length
+    _, _, logits_offsets, token_offsets = get_logits_and_tokens_offset_with_cp(
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+        padded_total_length,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+    if response_length == total_length:
+        mask_offsets = logits_offsets
+    else:
+        mask_offsets = tuple((start - prompt_length, end - prompt_length) for start, end in token_offsets)
+    return torch.cat([loss_mask[start:end] for start, end in mask_offsets], dim=0)
+
+
 def get_sum_of_sample_mean(
     total_lengths: list[int],
     response_lengths: list[int],
@@ -97,16 +239,24 @@ def get_sum_of_sample_mean(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
+    sample_denoms: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
+    if not calculate_per_token_loss:
+        if sample_denoms is None:
+            sample_denoms = torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+        else:
+            sample_denoms = torch.as_tensor(sample_denoms, device=loss_masks[0].device)
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
+                    for x_i, loss_mask_i, denom in zip(
+                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False
+                    )
                 ]
             )
 
@@ -127,27 +277,25 @@ def get_sum_of_sample_mean(
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-            prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            chunked_loss_mask = _slice_loss_mask_with_cp(
+                loss_mask,
                 total_length,
                 response_length,
                 qkv_format,
                 max_seq_len,
                 padded_total_length,
-                dynamic_cp_size=dynamic_cp_size,
-                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_size,
+                dynamic_cp_rank,
             )
-            loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-            loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-            chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
+            chunked_loss_masks.append(chunked_loss_mask)
             cp_chunk_lengths.append(chunked_loss_masks[i].size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-                    for x_i, chunked_loss_mask, loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
+                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
+                    for x_i, chunked_loss_mask, denom in zip(
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False
                     )
                 ]
             )
@@ -163,6 +311,42 @@ def get_sum_of_sample_mean(
             )
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
+
+
+def get_cp_local_mask_sums(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Return each row's loss-contributing token count on this CP rank."""
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+
+    local_mask_sums: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        chunked_loss_mask = _slice_loss_mask_with_cp(
+            loss_mask,
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size,
+            dynamic_cp_rank,
+        )
+        local_mask_sums.append(chunked_loss_mask.sum())
+
+    return torch.stack(local_mask_sums)
 
 
 def get_cp_local_num_tokens(
@@ -189,40 +373,21 @@ def get_cp_local_num_tokens(
     ``* cp_size`` on the loss/metric — a coupling that only cancels when CP is
     uniform across the step.
 
-    For ``cp_size == 1`` this reduces to the total number of unmasked tokens
-    (preserving the historical per-sample ``clamp_min(., 1)``).
+    For ``cp_size == 1`` this is exactly the total number of unmasked tokens.
+    Empty responses contribute zero, rather than being counted as one token; this
+    matches the CP-partitioned path and the global-valid-token loss definition.
     """
-    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-    if cp_size == 1:
-        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
-
-    # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
-    # counted tokens exactly match the ones sum_of_token contributes on this rank.
-    total: torch.Tensor | None = None
-    for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
-    ):
-        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
-        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-        prompt_length = total_length - response_length
-        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-            total_length,
-            response_length,
-            qkv_format,
-            max_seq_len,
-            padded_total_length,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-        )
-        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-        chunk_count = loss_mask_0.sum() + loss_mask_1.sum()
-        total = chunk_count if total is None else total + chunk_count
-
-    if total is None:
-        # No samples on this rank: mirror the empty-sum behaviour of cp_size == 1.
-        return sum([loss_mask.sum() for loss_mask in loss_masks])
-    return total
+    local_mask_sums = get_cp_local_mask_sums(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size,
+        dynamic_cp_rank,
+    )
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(

@@ -1,7 +1,16 @@
-.PHONY: help install test lint format clean docs docs-dev docs-build docs-preview check-registry check-train-image docker-train docker-dev
+.PHONY: help install test lint format clean docs docs-dev docs-build docs-preview check-registry check-train-image check-ascend-qs-base-image check-qs-dockerfile train docker-train docker-train-cu12 docker-train-cu13-blackwell docker-train-cu13-hopper docker-train-image docker-dev docker-dev-cu12 docker-dev-cu13-blackwell docker-dev-cu13-hopper docker-dev-image docker-ascend docker-qs-ascend
 
 DOCKER ?= docker
 DOCKERFILE ?= docker/Dockerfile
+CU13_DOCKERFILE ?= docker/Dockerfile.cu13
+CU13_BASE_IMAGE ?=
+CU13_BLACKWELL_TRAIN_IMAGE ?=
+CU13_HOPPER_TRAIN_IMAGE ?=
+CU13_BLACKWELL_DEV_IMAGE ?=
+CU13_HOPPER_DEV_IMAGE ?=
+ASCEND_DOCKERFILE ?= docker/Dockerfile.npu
+SOC_VERSION ?= ascend910_9391
+ASCEND_DOCKER_BUILDKIT ?= 1
 DOCKER_BUILD_PROGRESS ?= plain
 DOCKER_BUILD_ARGS ?=
 DO_PUSH ?= 1
@@ -10,10 +19,29 @@ BUILD_DATE := $(shell date +%Y%m%d)
 GIT_SHORT_HASH := $(shell git rev-parse --short=8 HEAD)
 
 IMAGE_REGISTRY := $(patsubst %/,%,$(strip $(REGISTRY)))
-DEFAULT_TRAIN_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)
-DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)
+DEFAULT_TRAIN_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu12
+DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu12
 
-ifeq ($(origin TRAIN_IMAGE),undefined)
+# Static pattern targets supply blackwell/hopper through $*. Keep train inputs separate
+# because their CUDA kernels are compiled for different architectures.
+CU13_EXTERNAL_TRAIN_IMAGE = $(strip $(if $(filter blackwell,$*),$(CU13_BLACKWELL_TRAIN_IMAGE),$(CU13_HOPPER_TRAIN_IMAGE)))
+CU13_DEFAULT_TRAIN_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$*
+CU13_EXTERNAL_DEV_IMAGE = $(strip $(if $(filter blackwell,$*),$(CU13_BLACKWELL_DEV_IMAGE),$(CU13_HOPPER_DEV_IMAGE)))
+CU13_DEFAULT_DEV_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$*
+
+# Ascend/NPU images share the same repository as GPU; the ascend- tag prefix keeps
+# aarch64 artifacts from ever overwriting the amd64 train-/dev- tags.
+ASCEND_DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):ascend-dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)
+ASCEND_QS_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):ascend-qs-$(BUILD_DATE)-$(GIT_SHORT_HASH)
+
+# QS wrapping reuses the external relax-ci Dockerfile.qs (verified pure-python /
+# arch-independent, so ARM64-safe). CI is responsible for checking out relax-ci and
+# pointing ASCEND_QS_DOCKERFILE at its docker/Dockerfile.qs; the Relax repo embeds neither
+# the external repo nor its credentials. ASCEND_QS_BASE_IMAGE defaults to the dev image.
+ASCEND_QS_DOCKERFILE ?=
+ASCEND_QS_BASE_IMAGE ?= $(ASCEND_DEV_IMAGE)
+
+ifeq ($(strip $(TRAIN_IMAGE)),)
 TRAIN_IMAGE := $(DEFAULT_TRAIN_IMAGE)
 BUILD_DEFAULT_TRAIN := 1
 else
@@ -37,9 +65,24 @@ help:
 	@echo "  make docs-dev      - Start documentation dev server"
 	@echo "  make docs-build    - Build documentation"
 	@echo "  make docs-preview  - Preview built documentation"
-	@echo "  REGISTRY=... make docker-train - Build and push the Docker train stage"
-	@echo "  REGISTRY=... make docker-dev   - Build and push the Docker development image"
-	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev - Build dev from an existing train image"
+	@echo "  REGISTRY=... make train - Alias for docker-train"
+	@echo "  REGISTRY=... make docker-train - Build and push the CUDA 12, CUDA 13 Blackwell, and CUDA 13 Hopper train images"
+	@echo "  REGISTRY=... make docker-train-cu12 - Build and push only the CUDA 12 train stage"
+	@echo "  REGISTRY=... make docker-train-cu13-blackwell - Build and push the CUDA 13 Blackwell train stage"
+	@echo "  REGISTRY=... make docker-train-cu13-hopper - Build and push the CUDA 13 Hopper train stage"
+	@echo "  CUDA 13 targets accept CU13_BASE_IMAGE=... independently of BASE_IMAGE"
+	@echo "  CUDA 13 dev targets reuse CU13_BLACKWELL_TRAIN_IMAGE=... or CU13_HOPPER_TRAIN_IMAGE=... when set"
+	@echo "  REGISTRY=... make docker-dev - Build and push the CUDA 12, CUDA 13 Blackwell, and CUDA 13 Hopper dev images"
+	@echo "  REGISTRY=... make docker-dev-cu12 - Build and push only the CUDA 12 dev image"
+	@echo "  REGISTRY=... make docker-dev-cu13-blackwell - Build and push only the CUDA 13 Blackwell dev image"
+	@echo "  REGISTRY=... make docker-dev-cu13-hopper - Build and push only the CUDA 13 Hopper dev image"
+	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev-cu12 - Build cu12 dev from an existing train image"
+	@echo "  TRAIN_IMAGE and DEV_IMAGE overrides apply to the cu12 variant"
+	@echo "  CUDA 13 dev output tags accept CU13_BLACKWELL_DEV_IMAGE=... and CU13_HOPPER_DEV_IMAGE=..."
+	@echo "  REGISTRY=... make docker-ascend - Build and push the complete Ascend/NPU image"
+	@echo "  REGISTRY=... ASCEND_QS_DOCKERFILE=... make docker-qs-ascend - Wrap an Ascend dev image into a QS image (optional)"
+	@echo "  Ascend targets accept BASE_IMAGE=... and SOC_VERSION=... (default ascend910_9391)"
+	@echo "  Ascend targets use BuildKit by default; set ASCEND_DOCKER_BUILDKIT=0 for legacy DinD"
 	@echo "  Set DO_PUSH=0 before make to skip pushing Docker images"
 	@echo "  Existing remote images are skipped; DO_PUSH=0 checks local images"
 
@@ -51,8 +94,7 @@ test:
 	pytest tests/
 
 lint:
-	flake8 relax/
-	mypy relax/
+	ruff check relax/
 
 format: # develop ## Code format using pre-commit tools
 	@which pre-commit 2>&1 > /dev/null || python -m pip install pre-commit==3.8.0
@@ -84,7 +126,27 @@ check-registry:
 check-train-image:
 	@test -n "$(strip $(TRAIN_IMAGE))" || { echo "TRAIN_IMAGE must not be empty" >&2; exit 2; }
 
-docker-train: check-registry
+check-ascend-qs-base-image:
+	@test -n "$(strip $(ASCEND_QS_BASE_IMAGE))" || { echo "ASCEND_QS_BASE_IMAGE must not be empty" >&2; exit 2; }
+
+check-qs-dockerfile:
+	@test -n "$(strip $(ASCEND_QS_DOCKERFILE))" || { echo "ASCEND_QS_DOCKERFILE is required (path to relax-ci docker/Dockerfile.qs)" >&2; exit 2; }
+	@test -f "$(strip $(ASCEND_QS_DOCKERFILE))" || { echo "ASCEND_QS_DOCKERFILE not found: $(ASCEND_QS_DOCKERFILE)" >&2; exit 2; }
+
+train: docker-train
+
+docker-train: docker-train-cu12 docker-train-cu13-blackwell docker-train-cu13-hopper
+
+docker-train-cu12: docker-train-image
+
+docker-train-cu13-blackwell docker-train-cu13-hopper: docker-train-cu13-%:
+	+$(MAKE) --no-print-directory docker-train-image \
+		DOCKERFILE="$(CU13_DOCKERFILE)" \
+		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
+		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
+		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"
+
+docker-train-image: check-registry
 	@echo "[docker] output train image: $(TRAIN_IMAGE)"
 	@set -e; \
 	if $(IMAGE_INSPECT) "$(TRAIN_IMAGE)" >/dev/null 2>&1; then \
@@ -99,7 +161,20 @@ docker-train: check-registry
 		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(TRAIN_IMAGE)"; fi; \
 	fi
 
-docker-dev: check-registry check-train-image
+docker-dev: docker-dev-cu12 docker-dev-cu13-blackwell docker-dev-cu13-hopper
+
+docker-dev-cu12: docker-dev-image
+
+docker-dev-cu13-blackwell docker-dev-cu13-hopper: docker-dev-cu13-%:
+	+$(MAKE) --no-print-directory docker-dev-image \
+		DOCKERFILE="$(CU13_DOCKERFILE)" \
+		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
+		DEV_IMAGE="$(or $(CU13_EXTERNAL_DEV_IMAGE),$(CU13_DEFAULT_DEV_IMAGE))" \
+		BUILD_DEFAULT_TRAIN=$(if $(CU13_EXTERNAL_TRAIN_IMAGE),0,1) \
+		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
+		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"
+
+docker-dev-image: check-registry check-train-image
 	@echo "[docker] input train image: $(TRAIN_IMAGE)"
 	@echo "[docker] output dev image: $(DEV_IMAGE)"
 	@set -e; \
@@ -107,7 +182,7 @@ docker-dev: check-registry check-train-image
 		echo "[docker] skip existing $(IMAGE_LOCATION) dev image: $(DEV_IMAGE)"; \
 	else \
 		if [ "$(BUILD_DEFAULT_TRAIN)" = "1" ]; then \
-			$(MAKE) --no-print-directory docker-train TRAIN_IMAGE="$(TRAIN_IMAGE)"; \
+			$(MAKE) --no-print-directory docker-train-image TRAIN_IMAGE="$(TRAIN_IMAGE)"; \
 		fi; \
 		$(DOCKER) build --progress=$(DOCKER_BUILD_PROGRESS) \
 			-f $(DOCKERFILE) \
@@ -117,4 +192,40 @@ docker-dev: check-registry check-train-image
 			$(PROXY_BUILD_ARGS) $(BASE_IMAGE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
 			.; \
 		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(DEV_IMAGE)"; fi; \
+	fi
+
+docker-ascend: check-registry
+	@echo "[docker] output ascend image: $(ASCEND_DEV_IMAGE)"
+	@set -e; \
+	if $(IMAGE_INSPECT) "$(ASCEND_DEV_IMAGE)" >/dev/null 2>&1; then \
+		echo "[docker] skip existing $(IMAGE_LOCATION) ascend image: $(ASCEND_DEV_IMAGE)"; \
+	else \
+		DOCKER_BUILDKIT=$(ASCEND_DOCKER_BUILDKIT) $(DOCKER) build --progress=$(DOCKER_BUILD_PROGRESS) \
+			-f $(ASCEND_DOCKERFILE) \
+			--target relax \
+			-t "$(ASCEND_DEV_IMAGE)" \
+			--build-arg SOC_VERSION="$(SOC_VERSION)" \
+			$(PROXY_BUILD_ARGS) $(BASE_IMAGE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
+			.; \
+		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(ASCEND_DEV_IMAGE)"; fi; \
+	fi
+
+# Optional: wrap an Ascend dev image into an internal QS image using relax-ci's
+# Dockerfile.qs. ASCEND_QS_DOCKERFILE must point at a relax-ci checkout; ASCEND_QS_BASE_IMAGE
+# defaults to the dev image built above but can be any existing Ascend dev image.
+docker-qs-ascend: check-registry check-qs-dockerfile check-ascend-qs-base-image
+	@echo "[docker] input ascend dev image: $(ASCEND_QS_BASE_IMAGE)"
+	@echo "[docker] output ascend qs image: $(ASCEND_QS_IMAGE)"
+	@set -e; \
+	if $(IMAGE_INSPECT) "$(ASCEND_QS_IMAGE)" >/dev/null 2>&1; then \
+		echo "[docker] skip existing $(IMAGE_LOCATION) ascend qs image: $(ASCEND_QS_IMAGE)"; \
+	else \
+		DOCKER_BUILDKIT=$(ASCEND_DOCKER_BUILDKIT) $(DOCKER) build --progress=$(DOCKER_BUILD_PROGRESS) \
+			--no-cache \
+			-f "$(ASCEND_QS_DOCKERFILE)" \
+			-t "$(ASCEND_QS_IMAGE)" \
+			--build-arg BASE_IMAGE="$(ASCEND_QS_BASE_IMAGE)" \
+			$(PROXY_BUILD_ARGS) $(DOCKER_BUILD_ARGS) \
+			"$(dir $(ASCEND_QS_DOCKERFILE))"; \
+		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(ASCEND_QS_IMAGE)"; fi; \
 	fi

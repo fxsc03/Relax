@@ -4,7 +4,7 @@ import os
 import ray
 
 from relax.distributed.ray.ray_actor import RayActor
-from relax.utils import device as device_utils
+from relax.utils.device import device_module
 
 
 # Refer to
@@ -18,6 +18,7 @@ from relax.utils import device as device_utils
 NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
     "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
@@ -31,8 +32,8 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def get_physical_gpu_id():
-    device = device_utils.current_device()
-    props = device_utils.get_device_properties(device)
+    device = device_module.current_device()
+    props = device_module.get_device_properties(device)
     return str(props.uuid)
 
 

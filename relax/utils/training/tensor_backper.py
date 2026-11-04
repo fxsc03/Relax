@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
@@ -64,7 +65,7 @@ class _TensorBackuperNormal(TensorBackuper):
             if name not in backup_dict:
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
-        device_utils.synchronize()
+        device_module.synchronize()
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -77,7 +78,7 @@ class _TensorBackuperNormal(TensorBackuper):
         for name, param in self._source_getter():
             assert name in backup_dict
             param.copy_(backup_dict[name], non_blocking=_NON_BLOCKING)
-        device_utils.synchronize()
+        device_module.synchronize()
 
 
 class _TensorBackuperNoop(TensorBackuper):
@@ -100,12 +101,12 @@ class _TensorBackuperNoop(TensorBackuper):
     def backup(self, tag: str) -> None:
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
-        device_utils.synchronize()
+        device_module.synchronize()
 
     def restore(self, tag: str) -> None:
         assert tag == self._single_tag
         assert _compute_hash_dict(dict(self._source_getter())) == self._backup_hash_dict
-        device_utils.synchronize()
+        device_module.synchronize()
 
 
 def _compute_hash_dict(tensors: dict[str, torch.Tensor]):
@@ -114,8 +115,12 @@ def _compute_hash_dict(tensors: dict[str, torch.Tensor]):
 
 def _compute_hash_tensor(x: torch.Tensor):
     # Not a real/good hash, but pretty fast
-    x = x.contiguous()
-    x = x.view(-1)
-    x = x.view(torch.uint32)
-    x = x.sum()
-    return x.item()
+    raw = x.contiguous().view(-1).view(torch.uint8)
+    full_word_bytes = raw.numel() // 4 * 4
+    if full_word_bytes == 0:
+        return raw.to(torch.uint32).sum().item()
+
+    value = raw[:full_word_bytes].view(torch.uint32).sum()
+    if full_word_bytes != raw.numel():
+        value = value + raw[full_word_bytes:].to(torch.uint32).sum()
+    return value.item()

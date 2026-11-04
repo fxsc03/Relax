@@ -4,6 +4,8 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 import contextlib
+import math
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,6 +13,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from relax.algorithms import algorithm_needs_critic
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils.logging_utils import get_logger
 
 
@@ -18,12 +22,13 @@ logger = get_logger(__name__)
 
 
 def validate_ppo_config(config: Namespace) -> None:
-    if getattr(config, "advantage_estimator", None) != "ppo":
+    if not algorithm_needs_critic(config):
         return
 
     resource = getattr(config, "resource", None) or {}
     if "critic" not in resource:
-        raise ValueError("--advantage-estimator ppo requires a 'critic' entry in --resource.")
+        estimator = getattr(config, "advantage_estimator", None)
+        raise ValueError(f"--advantage-estimator {estimator} requires a 'critic' entry in --resource.")
 
     if getattr(config, "fully_async", False) or getattr(config, "hybrid", False):
         raise ValueError("PPO does not currently support --fully-async or --hybrid.")
@@ -395,56 +400,311 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
-def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
-    # TODO: when megatron is not installed, fall back to naive implementation
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-
-    # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
-    logits = logits.unsqueeze(1)
-    tokens = tokens.unsqueeze(1)
-    return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+# ── M2PO: Second-Moment Trust Policy Optimization ──────────────────────────
+# Adapted from https://github.com/Infini-AI-Lab/M2PO (Apache 2.0)
+# Paper: "Prosperity before Collapse" (NeurIPS 2025), https://arxiv.org/abs/2510.01161
 
 
-# from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
-class _VocabParallelEntropy(torch.autograd.Function):
+def _solve_tau_from_sorted_delta2(sorted_delta2: torch.Tensor, target_sum: float) -> tuple[float, float]:
+    n = sorted_delta2.numel()
+    total = float(sorted_delta2.sum().item())
+    if target_sum >= total - 1e-12:
+        return 100000.0, total / n
+    if target_sum <= 1e-12:
+        return 0.0, 0.0
+    csum = torch.cumsum(sorted_delta2, dim=0)
+    for k in range(n):
+        left_sum = float(csum[k].item())
+        rest = n - k - 1
+        m2 = sorted_delta2[k].item() - 1e-12
+        if m2 * rest + left_sum >= target_sum - 1e-12:
+            if k == 0:
+                return 0.0, float(csum[-1].item()) / n
+            M2_after = (sorted_delta2[k - 1].item() * (rest + 1) + float(csum[k - 1].item())) / n
+            return max(sorted_delta2[k - 1].item() - 1e-12, 0.0) ** 0.5, M2_after
+    return 100000.0, total / n
+
+
+def _get_trust_region_delta_sq(ppo_kl: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    ratio = (-ppo_kl).exp()
+    pos_harmful = (advantages > 1e-12) & (ratio > 1.0 + 1e-12)
+    neg_harmful = (advantages < -1e-12) & (ratio < 1.0 - 1e-12)
+    return ppo_kl[pos_harmful | neg_harmful].pow(2)
+
+
+def kpo_clip_harmful_tokens(
+    ppo_kl: torch.Tensor, advantages: torch.Tensor, kl2_budget: float
+) -> tuple[float, float, float, float]:
+    tr_delta_sq = _get_trust_region_delta_sq(ppo_kl, advantages)
+    n = tr_delta_sq.numel()
+    if n == 0:
+        return 0.0, 100000.0, 0.0, 0.0
+    M2_now = float(tr_delta_sq.sum().detach().item() / n)
+    if M2_now <= kl2_budget + 1e-12:
+        return 0.0, 100000.0, M2_now, M2_now
+    sorted_delta2, _ = torch.sort(tr_delta_sq)
+    tau, M2_after = _solve_tau_from_sorted_delta2(sorted_delta2, kl2_budget * float(n))
+    return math.exp(-tau), math.exp(tau), M2_now, M2_after
+
+
+def compute_m2po_loss(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    kl2_budget: float,
+    miniclip_low: float = 0.3,
+    miniclip_high: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, float, float, float, float]:
+    clip_low, clip_high, M2_now, M2_after = kpo_clip_harmful_tokens(ppo_kl, advantages, kl2_budget)
+    eps_low = max(1.0 - clip_low, miniclip_low)
+    eps_high = max(clip_high - 1.0, miniclip_high)
+    ratio = (-ppo_kl).exp()
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * ratio.clamp(1.0 - eps_low, 1.0 + eps_high)
+    pg_loss = torch.maximum(pg_losses1, pg_losses2)
+    clipfrac = (pg_losses2 > pg_losses1).float()
+    return pg_loss, clipfrac, M2_now, M2_after, eps_low, eps_high
+
+
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# Experimental deferred softmax normalization changes floating-point operation order.
+# Keep it opt-in until GPU numerical/performance validation is available.
+# Single-rank collective elision is unconditional because SUM/MAX are identities.
+_LOGPROB_FAST_PATH = os.environ.get("RELAX_LOGPROB_FAST_PATH", "0") == "1"
+_LOGPROB_FAST_PATH_LOGGED = False
+
+
+def _maybe_all_reduce(tensor: torch.Tensor, op: dist.ReduceOp, process_group) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    # A 1-rank group makes MAX/SUM the identity; skipping is exact, not an
+    # approximation, so it does not need an experiment switch.
+    if _get_vocab_parallel_rank_size(process_group)[1] == 1:
+        return
+    dist.all_reduce(tensor, op=op, group=process_group)
+
+
+def _get_vocab_parallel_rank_size(process_group) -> tuple[int, int]:
+    if process_group is not None and hasattr(process_group, "rank") and hasattr(process_group, "size"):
+        return process_group.rank(), process_group.size()
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(group=process_group), dist.get_world_size(group=process_group)
+    return 0, 1
+
+
+class _VocabParallelLogProbEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
-        @torch.compile(dynamic=True)
-        def mul_reduce(a, b):
-            return (a * b).sum(dim=-1, keepdim=True)
+    def forward(
+        ctx,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        log_prob_keep_mask: torch.Tensor | None,
+        process_group,
+        with_entropy: bool,
+        with_entropy_grad: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with_entropy_grad = with_entropy and with_entropy_grad
+        global _LOGPROB_FAST_PATH_LOGGED
+        if _LOGPROB_FAST_PATH and not _LOGPROB_FAST_PATH_LOGGED:
+            _LOGPROB_FAST_PATH_LOGGED = True
+            logger.info("Relax logprob fast path enabled (RELAX_LOGPROB_FAST_PATH=1): deferred softmax normalization.")
+        vocab_parallel_logits = vocab_parallel_logits.float()
+        seq_len, vocab_parallel_size = vocab_parallel_logits.shape
+        rank, _world_size = _get_vocab_parallel_rank_size(process_group)
+        vocab_start_index = rank * vocab_parallel_size
+        vocab_end_index = vocab_start_index + vocab_parallel_size
 
-        logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
-        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
-        normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max
-        normalized_exp_logits = normalized_vocab_parallel_logits.exp_()
-        normalized_sum_exp_logits = normalized_exp_logits.sum(dim=-1, keepdim=True)
-        dist.all_reduce(normalized_sum_exp_logits, group=process_group)
-        softmax_logits = normalized_exp_logits.div_(normalized_sum_exp_logits)
-        sum_softmax_times_logits = mul_reduce(softmax_logits, vocab_parallel_logits)
-        dist.all_reduce(sum_softmax_times_logits, group=process_group)
-        entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
-        ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
-        return entropy.squeeze(dim=-1)
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target_1d = (target - vocab_start_index).clone()
+        masked_target_1d[target_mask] = 0
+        arange_1d = torch.arange(seq_len, device=vocab_parallel_logits.device)
+
+        # Deferring the normalize is only valid when nothing in forward reads the
+        # softmax; entropy does, so it stays on the original path.
+        defer_normalize = _LOGPROB_FAST_PATH and not with_entropy
+
+        def vocab_parallel_softmax(
+            logits: torch.Tensor,
+            inplace: bool = False,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            logits_max = logits.max(dim=-1, keepdim=True).values
+            _maybe_all_reduce(logits_max, dist.ReduceOp.MAX, process_group)
+            # Subtract the max for numerical stability. When ``inplace`` is set, the
+            # caller passed a scratch buffer it owns, so overwrite it instead of
+            # allocating another [seq_len, vocab] tensor.
+            normalized_logits = logits.sub_(logits_max) if inplace else logits - logits_max
+            # The normalized logit at the target position is the log-prob numerator;
+            # gather it (a small copy) before the in-place ``exp_`` destroys it.
+            predicted_logits = normalized_logits.view(-1, vocab_parallel_size)[arange_1d, masked_target_1d]
+            # Reuse the ``normalized_logits`` storage for exp and softmax so the whole
+            # softmax costs a single [seq_len, vocab] buffer instead of three.
+            exp_logits = normalized_logits.exp_()
+            sum_exp_logits = exp_logits.sum(dim=-1, keepdim=True)
+            _maybe_all_reduce(sum_exp_logits, dist.ReduceOp.SUM, process_group)
+            # ``div_`` is a full [seq_len, vocab] read-modify-write whose result the
+            # forward never reads -- it exists purely to be saved for backward, which
+            # then scales the same buffer by another per-row factor. Return the
+            # UNNORMALIZED exp and let backward fold 1/sum into that scale: the pass
+            # is removed, not moved. ``log_prob`` below uses sum_exp_logits directly
+            # and is unaffected.
+            if defer_normalize:
+                return predicted_logits, sum_exp_logits, exp_logits, logits_max
+            softmax = exp_logits.div_(sum_exp_logits)
+            return predicted_logits, sum_exp_logits, softmax, logits_max
+
+        entropy = vocab_parallel_logits.new_zeros((0,))
+        entropy_softmax = vocab_parallel_logits.new_empty((0,))
+        sum_softmax_times_logits = vocab_parallel_logits.new_empty((0,))
+
+        def sum_softmax_logits(softmax: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+            if softmax.is_cuda:
+                # Avoid materializing the full [seq_len, vocab] product buffer.
+                return torch.einsum("ij,ij->i", softmax, logits).unsqueeze(-1)
+            return (softmax * logits).sum(dim=-1, keepdim=True)
+
+        if log_prob_keep_mask is None:
+            predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, log_prob_logits_max = vocab_parallel_softmax(
+                vocab_parallel_logits
+            )
+            if with_entropy:
+                entropy_softmax = log_prob_softmax
+                sum_softmax_times_logits = sum_softmax_logits(entropy_softmax, vocab_parallel_logits)
+                _maybe_all_reduce(sum_softmax_times_logits, dist.ReduceOp.SUM, process_group)
+                entropy = log_prob_logits_max + log_prob_sum_exp_logits.log() - sum_softmax_times_logits
+                entropy = entropy.squeeze(dim=-1)
+        else:
+            if with_entropy:
+                _entropy_predicted_logits, entropy_sum_exp_logits, entropy_softmax, entropy_logits_max = (
+                    vocab_parallel_softmax(vocab_parallel_logits)
+                )
+                sum_softmax_times_logits = sum_softmax_logits(entropy_softmax, vocab_parallel_logits)
+                _maybe_all_reduce(sum_softmax_times_logits, dist.ReduceOp.SUM, process_group)
+                entropy = entropy_logits_max + entropy_sum_exp_logits.log() - sum_softmax_times_logits
+                entropy = entropy.squeeze(dim=-1)
+
+            local_target_rows = torch.nonzero(~target_mask, as_tuple=False).squeeze(-1)
+            log_prob_logits = vocab_parallel_logits.masked_fill(~log_prob_keep_mask, float("-inf"))
+            if local_target_rows.numel() > 0:
+                log_prob_logits[local_target_rows, masked_target_1d[local_target_rows]] = vocab_parallel_logits[
+                    local_target_rows, masked_target_1d[local_target_rows]
+                ]
+            # ``log_prob_logits`` is an owned scratch buffer here, so let the softmax
+            # consume it in place rather than allocating another copy.
+            predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, _log_prob_logits_max = vocab_parallel_softmax(
+                log_prob_logits, inplace=True
+            )
+
+        predicted_logits = predicted_logits.masked_fill_(target_mask, 0.0).unsqueeze(-1)
+        _maybe_all_reduce(predicted_logits, dist.ReduceOp.SUM, process_group)
+        log_prob = predicted_logits - log_prob_sum_exp_logits.log()
+
+        if not with_entropy_grad:
+            ctx.mark_non_differentiable(entropy)
+
+        ctx.with_entropy_grad = with_entropy_grad
+        # Metric-only entropy still returns values, but does not need the
+        # full-vocab entropy tensors kept alive for backward.
+        saved_entropy_softmax = entropy_softmax if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
+        saved_sum_softmax_times_logits = (
+            sum_softmax_times_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
+        )
+        saved_logits = vocab_parallel_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
+        # Under defer_normalize ``log_prob_softmax`` holds the unnormalized exp, so
+        # backward needs the row sums to finish the division it inherited.
+        ctx.defer_normalize = defer_normalize
+        saved_sum_exp_logits = log_prob_sum_exp_logits if defer_normalize else vocab_parallel_logits.new_empty((0,))
+        ctx.save_for_backward(
+            log_prob_softmax,
+            target_mask,
+            masked_target_1d,
+            saved_entropy_softmax,
+            saved_sum_softmax_times_logits,
+            saved_logits,
+            saved_sum_exp_logits,
+        )
+        return log_prob, entropy
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
-        # reuse softmax_logits as grad
-        vocab_parallel_logits.sub_(sum_softmax_times_logits)
-        softmax_logits.mul_(vocab_parallel_logits)
-        softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
-        # recover vocab_parallel_logits
-        vocab_parallel_logits.add_(sum_softmax_times_logits)
-        softmax_logits.mul_(-1)
-        return softmax_logits, None
+    def backward(
+        ctx, grad_log_prob: torch.Tensor | None, grad_entropy: torch.Tensor | None
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        (
+            log_prob_softmax,
+            target_mask,
+            masked_target_1d,
+            entropy_softmax,
+            sum_softmax_times_logits,
+            vocab_parallel_logits,
+            sum_exp_logits,
+        ) = ctx.saved_tensors
+
+        if grad_log_prob is None:
+            raise RuntimeError(
+                "_VocabParallelLogProbEntropy expected a materialized grad_log_prob. "
+                "Do not call ctx.set_materialize_grads(False)."
+            )
+
+        grad_entropy_input = None
+        if ctx.with_entropy_grad and grad_entropy is not None and grad_entropy.numel() > 0:
+            # In the unmasked path, entropy_softmax aliases log_prob_softmax.
+            # Build entropy grad before mutating log_prob_softmax below.
+            grad_entropy_input = sum_softmax_times_logits - vocab_parallel_logits
+            grad_entropy_input.mul_(entropy_softmax)
+            grad_entropy_input.mul_(grad_entropy.reshape(-1, 1))
+
+        vocab_parallel_size = log_prob_softmax.size(-1)
+        if ctx.defer_normalize:
+            # log_prob_softmax is exp(logits - max), still unnormalized. The default
+            # path below walks the [seq_len, vocab] buffer twice (neg_, then mul_);
+            # 1/sum, the negation and grad_log_prob are all per-row scalars, so fold
+            # them into one factor and touch the big tensor exactly once.
+            row_scale = grad_log_prob.reshape(-1, 1).div(sum_exp_logits).neg_()
+            grad_input = log_prob_softmax.mul_(row_scale)
+            grad_2d = grad_input.view(-1, vocab_parallel_size)
+            arange_1d = torch.arange(grad_2d.size(0), device=grad_2d.device)
+            # The +1 at the target position must carry the grad_log_prob factor that
+            # the fused row scale already applied to the rest of the row.
+            target_update = (~target_mask).to(dtype=grad_2d.dtype) * grad_log_prob.reshape(-1)
+            grad_2d[arange_1d, masked_target_1d] += target_update
+        else:
+            grad_input = log_prob_softmax.neg_()
+            grad_2d = grad_input.view(-1, vocab_parallel_size)
+            arange_1d = torch.arange(grad_2d.size(0), device=grad_2d.device)
+            target_update = (~target_mask).to(dtype=grad_2d.dtype)
+            grad_2d[arange_1d, masked_target_1d] += target_update
+            grad_input.mul_(grad_log_prob.reshape(-1, 1))
+
+        if grad_entropy_input is not None:
+            grad_input.add_(grad_entropy_input)
+
+        return grad_input, None, None, None, None, None
 
 
-def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
-    return _VocabParallelEntropy.apply(logits, process_group)
+def _calculate_log_probs_and_entropy_chunk(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    tp_group,
+    *,
+    with_entropy: bool,
+    with_entropy_grad: bool = True,
+    log_prob_keep_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    log_prob, entropy = _VocabParallelLogProbEntropy.apply(
+        logits,
+        tokens,
+        log_prob_keep_mask,
+        tp_group,
+        with_entropy,
+        with_entropy_grad,
+    )
+    if not with_entropy:
+        entropy = None
+    return log_prob, entropy
 
 
 def get_grpo_returns(
-    rewards: torch.Tensor,
+    rewards: torch.Tensor | list[float] | list[torch.Tensor],
     kl: list[torch.Tensor],
 ):
     returns = []
@@ -981,36 +1241,58 @@ def chunked_gae(
     return advantages, returns
 
 
-def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
+def calculate_log_probs_and_entropy(
+    logits,
+    tokens,
+    tp_group,
+    with_entropy: bool = False,
+    chunk_size: int = -1,
+    log_prob_keep_mask=None,
+    with_entropy_grad: bool = True,
+):
     logits = logits.contiguous()
-    # TODO: not sure why we need to clone the logits here.
-    # Without the clone, the backward will trigger inplace edit error.
-    # It seems that the function with tp will modify the logits inplace.
     entropy = None
     if logits.size(0) != 0:
         if chunk_size > 0:
             num_chunks = (logits.size(0) - 1) // chunk_size + 1
-            tokens_chunks = tokens.chunk(num_chunks, dim=0)
             logits_chunks = logits.chunk(num_chunks, dim=0)
+            tokens_chunks = tokens.chunk(num_chunks, dim=0)
+            mask_chunks = (
+                log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
+            )
+
             log_probs = []
-            for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
-                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+            entropy_chunks = []
+            for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
+                log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
+                    logits_chunk,
+                    tokens_chunk,
+                    tp_group,
+                    with_entropy=with_entropy,
+                    with_entropy_grad=with_entropy_grad,
+                    log_prob_keep_mask=mask_chunk,
+                )
                 log_probs.append(log_prob)
+                if entropy_chunk is not None:
+                    entropy_chunks.append(entropy_chunk)
             log_prob = torch.cat(log_probs, dim=0)
-            if with_entropy:
-                entropys = []
-                for _, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
-                    entropy = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
-                    entropys.append(entropy)
-                entropy = torch.cat(entropys, dim=0)
+            if entropy_chunks:
+                entropy = torch.cat(entropy_chunks, dim=0)
         else:
-            log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
-            if with_entropy:
-                entropy = compute_entropy_from_logits(logits.clone(), tp_group)
+            log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
+                logits,
+                tokens,
+                tp_group,
+                with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
+                log_prob_keep_mask=log_prob_keep_mask,
+            )
     else:
-        log_prob = logits.new_zeros((0,))
+        # Empty CP response shards still participate in differentiable
+        # redistribution; keep the zero-size result connected to logits.
+        log_prob = logits.sum(dim=-1)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob if with_entropy_grad else log_prob.detach()
 
     return log_prob, entropy
 
@@ -1029,6 +1311,7 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
 
 
 _RELAX_HF_OUTPUT_LAYER_ATTR = "_relax_hf_output_layer"
+_RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR = "_relax_seq_cls_hf_output_layer"
 
 _CRITIC_VH_INIT_STATS_ATTR = "_critic_value_head_init_stats"
 _CRITIC_VH_VERIFIED_ATTR = "_critic_value_head_verified"
@@ -1140,6 +1423,102 @@ def install_critic_value_head_in_provider(
     )
 
 
+def install_sequence_classification_head_in_provider(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Install a replicated ``hidden_size -> num_labels`` head before DDP.
+
+    Only the actor's final PP/VPP chunk owns the classification head. Bridge
+    models stash their vocabulary head under an unregistered attribute so HF
+    CausalLM loading can temporarily restore it.
+    """
+    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    num_labels = int(args.num_labels)
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == num_labels:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=num_labels,
+        config=owner.config,
+        bias=False,
+    )
+
+
+def ensure_sequence_classification_head_trainable(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+) -> None:
+    """Undo PEFT/freeze wrappers that would otherwise freeze the task head."""
+    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+        return
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+    head = owner.output_layer
+    if not isinstance(head, LinearForLastLayer) or head.out_features != int(args.num_labels):
+        raise TypeError(f"sequence classification output layer is not installed: got {type(head).__name__}")
+    for param in head.parameters():
+        param.requires_grad = True
+
+
+@contextlib.contextmanager
+def use_sequence_classification_lm_head_for_hf_load(model):
+    """Temporarily restore Bridge vocabulary heads while loading HF weights."""
+    restored_heads = []
+    try:
+        for model_chunk in model:
+            owner = _find_output_layer_owner(model_chunk)
+            if owner is None or not hasattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR):
+                continue
+
+            classification_head = owner.output_layer
+            classification_param_ids = tuple(id(param) for param in classification_head.parameters())
+            lm_head = getattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+            restored_heads.append((owner, classification_head, classification_param_ids))
+
+            classification_param = next(classification_head.parameters(), None)
+            if classification_param is not None:
+                lm_head.to(device=classification_param.device, dtype=classification_param.dtype)
+            owner.output_layer = lm_head
+        yield
+    finally:
+        for owner, classification_head, classification_param_ids in reversed(restored_heads):
+            owner.output_layer = classification_head
+            object.__delattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+            assert owner.output_layer is classification_head, (
+                "sequence classification head object changed during HF checkpoint loading"
+            )
+            assert tuple(id(param) for param in classification_head.parameters()) == classification_param_ids, (
+                "sequence classification head parameters changed during HF checkpoint loading"
+            )
+
+
+def release_sequence_classification_lm_heads(model) -> None:
+    """Drop any unregistered Bridge LM-head references after checkpoint
+    load."""
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is not None and hasattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR):
+            object.__delattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+
+
 @contextlib.contextmanager
 def use_critic_lm_head_for_hf_load(model):
     """Temporarily restore the stashed LM head for HF Bridge weight loading.
@@ -1194,6 +1573,49 @@ def _ddp_owns_param(model_chunk: torch.nn.Module, param: torch.nn.Parameter) -> 
             if mapping is not None and param in mapping:
                 return True
     return False
+
+
+def validate_sequence_classification_head_registration(model, optimizer, args) -> tuple[int, ...]:
+    """Verify shape, trainability, live-model registration, and DDP
+    ownership."""
+    del optimizer  # DistributedOptimizer shards ownership; DDP is the stable registration contract.
+    classification_head_param_ids = []
+
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        classification_head = owner.output_layer
+        assert isinstance(classification_head, LinearForLastLayer), (
+            "sequence classification output layer must be LinearForLastLayer, "
+            f"got {type(classification_head).__name__}"
+        )
+        expected_shape = (int(args.num_labels), owner.config.hidden_size)
+        assert tuple(classification_head.weight.shape) == expected_shape, (
+            f"sequence classification head weight must have shape {expected_shape}, "
+            f"got {tuple(classification_head.weight.shape)}"
+        )
+        assert classification_head.bias is None, "sequence classification head must use bias=False"
+
+        registered_param_ids = {id(param) for param in model_chunk.parameters()}
+        for name, param in classification_head.named_parameters(recurse=False):
+            param_name = f"output_layer.{name}"
+            assert param.requires_grad, f"sequence classification head parameter {param_name} is frozen"
+            assert id(param) in registered_param_ids, (
+                f"sequence classification head parameter {param_name} is not registered in the live model"
+            )
+            assert _ddp_owns_param(model_chunk, param), (
+                f"DDP does not own sequence classification head parameter {param_name}"
+            )
+            classification_head_param_ids.append(id(param))
+
+    from megatron.core import mpu
+
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        assert classification_head_param_ids, "sequence classification head was not found on the final pipeline stage"
+    else:
+        assert not classification_head_param_ids, "sequence classification head exists on a non-final pipeline stage"
+    return tuple(classification_head_param_ids)
 
 
 def validate_critic_value_head_registration(model, optimizer) -> tuple[int, ...]:
@@ -1326,3 +1748,58 @@ def maybe_verify_critic_value_head_movement(model, optimizer, update_successful:
                 count,
             )
             setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)
+
+
+def install_reward_model_head_in_provider(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Install the offline reward-model scalar head before DDP/optimizer
+    construction."""
+    if role != "actor" or not post_process or not is_rm_mode(args):
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == 1:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=1,
+        config=owner.config,
+        bias=False,
+    )
+
+
+def validate_reward_model_head_registration(model, optimizer) -> tuple[int, ...]:
+    """Validate RM scalar-head shape, bias contract, registration, and DDP
+    ownership."""
+    del optimizer
+    parameter_ids = []
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        head = owner.output_layer
+        assert isinstance(head, LinearForLastLayer), (
+            f"reward-model output layer must be LinearForLastLayer, got {type(head).__name__}"
+        )
+        assert tuple(head.weight.shape) == (1, owner.config.hidden_size), (
+            f"reward-model head weight must have shape (1, {owner.config.hidden_size}), got {tuple(head.weight.shape)}"
+        )
+        assert head.bias is None, "reward-model scalar head must use bias=False"
+        registered_parameter_ids = {id(parameter) for parameter in model_chunk.parameters()}
+        assert id(head.weight) in registered_parameter_ids, "reward-model output_layer.weight is not registered"
+        assert _ddp_owns_param(model_chunk, head.weight), "DDP does not own reward-model output_layer.weight"
+        parameter_ids.append(id(head.weight))
+    return tuple(parameter_ids)

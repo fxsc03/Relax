@@ -6,9 +6,9 @@ from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict
 
-import ray
 import torch
 
 from relax.utils.http_utils import is_port_available
@@ -74,17 +74,36 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
 
 
 def get_current_node_ip():
+    import ray
+
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")
     return address
 
 
-def get_free_port(start_port=10000, consecutive=1):
+def get_free_port(start_port=10000, consecutive=1, max_port=None):
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
+    #
+    # max_port (optional, additive): when set, the highest port in the returned
+    # block (port + consecutive - 1) must be <= max_port; otherwise a RuntimeError
+    # is raised instead of scanning unboundedly into the OS ephemeral range
+    # (typically 32768-60999). Default None preserves the original unbounded
+    # behaviour for all existing callers.
     port = start_port
+    if max_port is not None and port + consecutive - 1 > max_port:
+        raise RuntimeError(
+            f"start_port {start_port} + {consecutive} exceeds max_port {max_port}; "
+            "widen the window via the RELAX_WEIGHT_SYNC_PORT_BASE/MAX (weight sync) or "
+            "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE/MAX (scale precheck) env vars"
+        )
     while not all(is_port_available(port + i) for i in range(consecutive)):
         port += 1
+        if max_port is not None and port + consecutive - 1 > max_port:
+            raise RuntimeError(
+                f"No free block of {consecutive} consecutive port(s) in "
+                f"[{start_port}, {max_port}] (exhausted the bounded window); widen the window via the RELAX_WEIGHT_SYNC_PORT_BASE/MAX (weight sync) or RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE/MAX (scale precheck) env vars"
+            )
     return port
 
 
@@ -161,4 +180,21 @@ def _chunk_by_size(objects: Iterable[Any], compute_size: Callable[[Any], int], c
 def get_hf_config(hf_checkpoint: str):
     from transformers import AutoConfig
 
-    return AutoConfig.from_pretrained(hf_checkpoint)
+    return AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+
+
+def resolve_is_vl_model(provider: object | None, checkpoint: str | None) -> bool:
+    """Prefer an explicit provider declaration over checkpoint metadata.
+
+    ``relax_is_multimodal`` describes the selected model, independent of the
+    current batch's contents. Providers without a declaration retain the
+    processor-config heuristic, including custom and raw model providers.
+    """
+    declared = getattr(provider, "relax_is_multimodal", None)
+    if declared is not None:
+        if not isinstance(declared, bool):
+            raise TypeError("provider.relax_is_multimodal must be bool or None")
+        return declared
+    if checkpoint is None:
+        return False
+    return any((Path(checkpoint) / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))

@@ -18,7 +18,7 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 ### Megatron 权重转 HF 权重
 
 ::: tip 使用 Megatron Bridge 无需手动转换
-Relax 默认使用 [Megatron Bridge](../../../relax/backends/megatron/mbridge/) 作为训练后端的权重桥接层，在训练过程中自动完成 HF ↔ Megatron 权重的双向转换，**无需任何手动转换步骤**。只需在启动脚本中指定以下选项即可：
+Relax 默认使用 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 作为训练后端的权重桥接层，在训练过程中自动完成 HF ↔ Megatron 权重的双向转换，**无需任何手动转换步骤**。只需在启动脚本中指定以下选项即可：
 :::
 
 ```bash
@@ -103,7 +103,7 @@ Relax 支持加载 `.jsonl` 和 `.parquet` 格式文件。以 `.jsonl` 为例，
 ```bash
 python scripts/tools/process_openr1.py \
   --input-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
-  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001-test.parquet
+  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 
 # --md-dir 指向 image 和 audio 文件目录所在路径，
 # 用于将相对路径拼接为绝对路径，若不传则使用相对路径。
@@ -489,6 +489,6 @@ tail -f /tmp/ray/session_latest/logs/serve/*.log
 
 ## 获取帮助
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [介绍](../guide/introduction.md)

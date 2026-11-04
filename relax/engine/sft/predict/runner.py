@@ -23,6 +23,7 @@ from typing import Any
 import requests
 import torch.distributed as dist
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -43,6 +44,11 @@ def run_sft_predict(actor, rollout_id: int) -> None:
     from relax.backends.megatron.initialize import is_megatron_main_rank
 
     args = actor.args
+    # Cache the topology-derived role while Megatron process groups are live.
+    # sleep() and update_weights() intentionally destroy the reloadable NCCL
+    # groups until wake_up(), so querying mpu ranks during predict would access
+    # a ReloadableProcessGroup whose inner group is None.
+    is_main_rank = is_megatron_main_rank()
     dist.barrier(group=get_gloo_group())
     _t_predict_start = time.monotonic()
     _t_sleep = _t_update = _t_http = _t_wake = 0.0
@@ -54,7 +60,7 @@ def run_sft_predict(actor, rollout_id: int) -> None:
     actor.update_weights()
     _t_update = time.monotonic() - _t
     dist.barrier(group=get_gloo_group())
-    if is_megatron_main_rank():
+    if is_main_rank:
         _t = time.monotonic()
         try:
             # Without a timeout, a hung rollout service blocks this rank
@@ -76,7 +82,7 @@ def run_sft_predict(actor, rollout_id: int) -> None:
         _t = time.monotonic()
         actor.wake_up()
         _t_wake = time.monotonic() - _t
-    if is_megatron_main_rank():
+    if is_main_rank:
         step = compute_rollout_step(args, rollout_id)
         metrics = {
             "perf/sft_predict_time": time.monotonic() - _t_predict_start,
@@ -119,7 +125,7 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         # leaking KV/weights would starve the next training step's GPU
         # memory. RL: rollout manages its own offload in `_async_run`,
         # skip here.
-        if getattr(rollout.config, "loss_type", None) == "sft" and rollout.config.offload_rollout:
+        if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:
