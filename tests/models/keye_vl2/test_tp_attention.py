@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from torch.utils.checkpoint import checkpoint
 
 
-def _tp_worker(rank: int, init_method: str) -> None:
+def _tp_worker(rank: int, init_method: str, backend: str = "dsa") -> None:
     from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -87,15 +87,38 @@ def _tp_worker(rank: int, init_method: str) -> None:
     shard = KeyeCoreAttention(config(4), 1, pg_collection=SimpleNamespace(tp=group)).cuda().bfloat16()
     shard.load_state_dict(base.state_dict())
     shard.ddp_config = SimpleNamespace()
-    for boundaries, dummy, recompute in [
+    cases = [
         ([0, 32, 64], False, False),
         ([0, 2080, 2112], False, True),
         ([0, 64], True, False),
-    ]:
+    ]
+    selections = []
+    patch = pytest.MonkeyPatch()
+    if backend == "dosa":
+        from relax.models.keye_vl2 import attention as implementation
+
+        base.sa_indexer.requires_grad_(False)
+        shard.sa_indexer.requires_grad_(False)
+        shard.config.keye_dsa_backend = "dosa"
+        cases = [([0, 4112, 4144], False, True)]
+        original_select = implementation.dosa_select
+
+        def record_selection(*args, **kwargs):
+            selected = original_select(*args, **kwargs)
+            if len(args[1]) > 4096:
+                assert selected is not None
+                selections.append((torch.is_grad_enabled(), selected.clone()))
+            return selected
+
+        patch.setattr(implementation, "dosa_select", record_selection)
+
+    for boundaries, dummy, recompute in cases:
         base.zero_grad(set_to_none=True)
         shard.zero_grad(set_to_none=True)
         length = boundaries[-1]
         valid = torch.arange(length, device="cuda") < length - 3
+        if backend == "dosa":
+            valid[boundaries[1] - 3 : boundaries[1]] = False
         packed = SimpleNamespace(cu_seqlens_q_cpu=boundaries, keye_valid_mask=valid, is_dummy=dummy)
         full = [
             torch.randn(length, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -126,6 +149,16 @@ def _tp_worker(rank: int, init_method: str) -> None:
             target = full_tensor.grad[:, rank * heads : (rank + 1) * heads]
             assert tensor.grad.isfinite().all()
             torch.testing.assert_close(tensor.grad, target, atol=0.06, rtol=0.08)
+        if backend == "dosa":
+            assert [grad_enabled for grad_enabled, _ in selections] == [False, True]
+            torch.testing.assert_close(selections[0][1], selections[1][1], atol=0, rtol=0)
+            for _, selected in selections:
+                replica = selected.clone()
+                dist.broadcast(replica, src=0, group=group)
+                torch.testing.assert_close(selected, replica, atol=0, rtol=0)
+            for parameter, reference in zip(shard.parameters(), base.parameters()):
+                assert parameter.grad is None and reference.grad is None
+            continue
         for parameter in shard.parameters():
             assert parameter.average_gradients_across_tp_domain
             parameter.main_grad = parameter.grad
@@ -140,12 +173,18 @@ def _tp_worker(rank: int, init_method: str) -> None:
                 replica = parameter.clone()
                 dist.broadcast(replica, src=0, group=group)
                 torch.testing.assert_close(parameter, replica, atol=0, rtol=0)
+    patch.undo()
     dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Keye TP4 gradient regression needs four CUDA devices")
 def test_keye_tp4_sp_matches_tp1_outputs_gradients_and_indexer_update(tmp_path):
     mp.spawn(_tp_worker, args=(f"file://{tmp_path / 'tp-init'}",), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Keye DoSA TP4/SP regression needs four CUDA devices")
+def test_keye_dosa_tp4_sp_matches_frozen_dsa_outputs_gradients_and_recomputation(tmp_path):
+    mp.spawn(_tp_worker, args=(f"file://{tmp_path / 'dosa-tp-init'}", "dosa"), nprocs=4, join=True)
 
 
 def test_keye_custom_output_projection_uses_explicit_row_mapping():

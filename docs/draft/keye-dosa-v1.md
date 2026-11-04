@@ -541,3 +541,60 @@ Further validation was stopped at the user's request. Final status:
 The implementation addresses expensive per-head screening, seed re-screening,
 local-only packing and serial refinement. It is still an experimental opt-in
 backend: no tested real-input configuration beat DSA, so DSA remains the default.
+
+## H800 continuation attempt (2026-11-04)
+
+Resumed from commit `45d38ea` on `feat/fengxiaoshi/DoSA`. This checkout has
+the historical JSON results, but not the Git-ignored activation archive at
+`examples/models/keye-vl2/scripts/log/dosa-optimization-20261104/`. A local
+Keye checkpoint was located; no new activations or performance measurements
+have been produced in this attempt.
+
+The host exposes NVIDIA H800 GPUs with 81559 MiB each. GPU 1 was idle at the
+preflight check and was used for the existing correctness suite. Other GPUs
+were occupied, so this is not an exclusive-node measurement. Installed
+versions are Torch 2.9.1+cu129, Triton 3.5.1, SGLang 0.5.9, FlashInfer 0.6.3,
+MCore 0.16.0rc0 and Transformer Engine 2.10.0. The Keye recipe expects the
+matching SGLang 0.5.21 training environment.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH="$PWD:/root/Megatron-LM" \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 timeout 600 \
+  python -m pytest -q tests/models/keye_vl2/test_dosa.py \
+  tests/models/keye_vl2/test_indexer_scores.py \
+  tests/models/keye_vl2/test_keye_vl2_attention.py \
+  --junitxml=/tmp/keye-dosa-h800-correctness.xml \
+  > /tmp/keye-dosa-h800-correctness.log 2>&1
+```
+
+Result: **23 passed, 32 failed in 50.27 seconds**. These are execution failures,
+not skips and not a successful regression run:
+
+| Failed cases | Observed cause |
+| ---: | --- |
+| 22 | Installed FlashInfer `top_k` rejects `deterministic`; the shared DSA scorer requires deterministic original-ID tie breaking. |
+| 5 | `fast_hadamard_transform` is absent. |
+| 5 | Installed SGLang does not export `KVWriteLoc` from `sglang.srt.mem_cache.memory_pool`. |
+
+The Top-K contract was not weakened or replaced for benchmarking. Matching
+dependencies are required before rerunning correctness and comparing performance.
+No host dependencies, CUDA stack, running services or training jobs were changed.
+
+Added a pending four-GPU regression in `tests/models/keye_vl2/test_tp_attention.py`:
+`test_keye_dosa_tp4_sp_matches_frozen_dsa_outputs_gradients_and_recomputation`.
+It reuses the TP4/SP worker with a 4112-token document plus a short document,
+per-document padding, a frozen indexer and checkpoint recomputation. It checks
+outputs and Q/K/V gradients against TP1 DSA, verifies that both forward and
+recomputation enter the long DoSA path, compares selected IDs across those
+calls and across ranks, and requires absent frozen-indexer gradients. The
+existing trainable DSA scenarios remain unchanged. This addresses a missing
+distributed behavior check at the cost of one four-process GPU test; a
+single-GPU test cannot exercise SP gathering and TP replica agreement.
+
+The new TP4/SP case and CP2 rerun remain unexecuted because of the dependency
+failures above. Full-model prefill/extend, complete frozen-indexer training
+steps and multi-node integration also remain unexecuted; a matching runtime
+and confirmed cluster configuration are still needed. The historical shared
+H20 measurements remain the only valid performance evidence: none of the
+60 new-selector cases beat DSA, with a best DSA/DoSA ratio of about 0.606x.
+There is no new H800 speedup result.
