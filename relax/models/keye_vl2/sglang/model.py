@@ -24,7 +24,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeForCausalLM, Qwen3MoeModel
 from sglang.srt.runtime_context import get_model, get_parallel
 
-from relax.models.keye_vl2.dosa import backend_config, dosa_select
+from relax.models.keye_vl2.dosa import DoSASeedState, backend_config, dosa_select
 from relax.models.keye_vl2.indexer import KeyeIndexer, indexer_scores
 from relax.models.keye_vl2.norm import RMSNorm as StableRMSNorm
 from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
@@ -185,6 +185,24 @@ class KeyeAttention(Qwen3MoeAttention):
             raise ValueError("Keye reference rollout supports extend/decode only")
         for batch_index, (length, query_length) in enumerate(zip(lengths, query_lengths)):
             length = int(length)  # CPU metadata, never a GPU synchronization.
+            seed_state = None
+            if getattr(self, "keye_dsa_backend", "dsa") == "dosa":
+                # One bounded carry per layer. Native request IDs are CPU
+                # metadata; switching requests retires the previous witnesses.
+                rids = getattr(forward_batch, "rids", None)
+                rid = rids[batch_index] if rids is not None else None
+                previous = getattr(self, "_dosa_seed_request", None)
+                if (
+                    rid is not None
+                    and previous is not None
+                    and previous[0] == rid
+                    and query_length < length
+                    and previous[1].key_count <= length
+                ):
+                    seed_state = previous[1]
+                else:
+                    seed_state = DoSASeedState()
+                self._dosa_seed_request = (rid, seed_state)
             slots = req_to_token[batch_index, :length].long()
             all_k = pool.get_key_buffer(layer_id)[slots]
             all_v = pool.get_value_buffer(layer_id)[slots]
@@ -197,13 +215,20 @@ class KeyeAttention(Qwen3MoeAttention):
                 selected = None
                 if getattr(self, "keye_dsa_backend", "dsa") == "dosa":
                     selected = dosa_select(
-                        iq[start:end], keys, iw[start:end], token_offsets, heads=self.keye_dosa_heads
+                        iq[start:end],
+                        keys,
+                        iw[start:end],
+                        token_offsets,
+                        heads=self.keye_dosa_heads,
+                        seed_state=seed_state,
                     )
                 if selected is None:
                     scores = indexer_scores(iq[start:end], keys, iw[start:end])
                     scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
                     selected = dsa_topk_indices(scores)
                     selected_valid = causal.gather(1, selected)
+                    if seed_state is not None:
+                        seed_state.publish(selected, token_offsets, length, selected_valid)
                 else:
                     selected_valid = (selected >= 0) & causal.gather(1, selected.clamp_min(0).long())
                     selected = selected.clamp_min(0)

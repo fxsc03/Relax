@@ -10,6 +10,8 @@ from typing import Any
 
 import torch
 
+from .dosa_seed import DoSASeedState
+
 
 def backend_config(source: Any) -> tuple[str, int]:
     backend = getattr(source, "keye_dsa_backend", "dsa")
@@ -38,7 +40,9 @@ def dosa_select(
     valid_keys: torch.Tensor | None = None,
     *,
     heads: int = 4,
-    seed_size: int = 4096,
+    seed_size: int | None = None,
+    seed_policy: str = "informative",
+    seed_state: DoSASeedState | None = None,
     stats: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
     """Return exact IDs, or None to request the caller's original DSA path.
@@ -63,11 +67,15 @@ def dosa_select(
         or torch.cuda.get_device_capability(query.device)[0] not in (8, 9)
     ):
         return None
+    if seed_policy not in ("uniform", "informative"):
+        raise ValueError("seed_policy must be uniform or informative")
+    if seed_size is None:
+        seed_size = 12288 if seed_policy == "informative" else 4096
     rows, width = query.shape[0], key.shape[0]
     # Bound integer seed arithmetic, and exclude zero-width attention from
     # this optimization (the caller owns its existing empty-input behavior).
     if (
-        seed_size not in (2048, 4096, 8192)
+        seed_size not in (2048, 4096, 8192, 12288)
         or width == 0
         or width > 262144
         or offsets.shape != (rows,)
@@ -86,8 +94,18 @@ def dosa_select(
         if stats is not None:
             counts = visible.sum(-1, dtype=torch.int32)
             zero = torch.zeros_like(counts)
-            stats.update(visible=counts, seed_count=zero, survivors=zero, unbounded=zero)
-        return tokens.expand(rows, -1).masked_fill(~visible, -1)
+            stats.update(
+                visible=counts,
+                seed_count=zero,
+                survivors=zero,
+                unbounded=zero,
+                exact_score_rejected=zero,
+                selection_candidates=counts,
+            )
+        result = tokens.expand(rows, -1).masked_fill(~visible, -1)
+        if rows and seed_state is not None and seed_policy == "informative":
+            seed_state.publish(result, offsets, width)
+        return result
     # All keys would be seeds; no screening is possible. H20 measurements
     # also show the original selector is faster here (see the validation note).
     if width <= seed_size:
@@ -115,11 +133,22 @@ def dosa_select(
     counts = torch.empty((rows, tiles), device=query.device, dtype=torch.int32)
     unsafe = torch.empty_like(counts)
     candidate_ids = torch.empty((rows, capacity), device=query.device, dtype=torch.int32)
-    codes = torch.zeros((rows, capacity + 2048), device=query.device, dtype=torch.int64)
+    words = torch.empty((rows, capacity + 2048), device=query.device, dtype=torch.uint32)
+    low = torch.empty((rows, capacity + 2048), device=query.device, dtype=torch.uint8)
+    lengths = torch.empty((rows,), device=query.device, dtype=torch.int32)
+    boundary_ids = torch.empty((rows, capacity + 2048), device=query.device, dtype=torch.uint32)
     launch = {"num_warps": 4, "enable_fp_fusion": False}
+    grouped = seed_policy == "informative"
+    ordered_ids = valid_ids
+    if rows and grouped:
+        from .dosa_seed import informative_order
+
+        ordered_ids, seed_source, votes = informative_order(
+            query, key, weights, offsets, valid, valid_ids, visible, seed_size, seed_state
+        )
     if rows:
         parallel.make_seeds[(rows, seed_size // 128)](
-            valid_ids, visible, seeds, bases, width, rows, seed_size, **launch
+            ordered_ids, visible, seeds, bases, width, rows, seed_size, ORIGINAL=valid_ids, GROUPED=grouped, **launch
         )
         kernels.seed_scores[(rows, seed_size // 128)](
             query, key, weights, seeds, visible, seed_scores, query.stride(0), weights.stride(0), seed_size, **launch
@@ -133,7 +162,20 @@ def dosa_select(
         import triton
 
         parallel.seed_codes[(rows,)](
-            seed_scores, seeds, seed_top, visible, valid_ids, codes, threshold, seed_size, capacity, **launch
+            seed_scores,
+            seeds,
+            seed_top,
+            visible,
+            valid_ids,
+            None,
+            threshold,
+            seed_size,
+            capacity,
+            WORDS=words,
+            LOW=low,
+            LENGTHS=lengths,
+            PACKED=True,
+            **launch,
         )
         parallel.pack_plan[(rows,)](plan, visible, vectors, coefficients, error, heads, seed_size, **launch)
         parallel.key_norm[((width + 127) // 128,)](key, norms, width, **launch)
@@ -145,7 +187,7 @@ def dosa_select(
             error,
             threshold,
             bases,
-            valid_ids,
+            ordered_ids,
             visible,
             flags,
             counts,
@@ -157,23 +199,34 @@ def dosa_select(
             capacity,
             tiles,
             4 * max(4, triton.next_power_of_2(heads + 1)),
+            GROUPED=grouped,
             **launch,
         )
         prefix = torch.cumsum(counts, -1, dtype=torch.int32)
         parallel.compact[(rows, tiles)](
-            flags, prefix, bases, valid_ids, candidate_ids, capacity, tiles, seed_size, **launch
+            flags, prefix, bases, ordered_ids, candidate_ids, capacity, tiles, seed_size, GROUPED=grouped, **launch
         )
-        parallel.refine[(rows, tiles)](query, key, weights, candidate_ids, prefix, codes, capacity, tiles, **launch)
-        # The 48-bit codes fit signed int64; original IDs encode tie breaks.
-        selected_codes = parallel.select_codes(codes, visible)
-        parallel.decode[(rows,)](selected_codes, result, **launch)
+        parallel.refine[(rows, tiles)](
+            query, key, weights, candidate_ids, prefix, threshold, words, low, lengths, capacity, tiles, **launch
+        )
+        parallel.select_records[(rows,)](words, low, lengths, boundary_ids, result, capacity + 2048, 512, **launch)
+    if rows and seed_state is not None and grouped:
+        seed_state.publish(result, offsets, width)
     if stats is not None:
         stats.update(
+            seed_ids=seeds,
+            seed_order=ordered_ids,
+            seed_bases=bases,
+            seed_threshold=threshold,
             visible=visible,
             seed_count=torch.where(visible <= 2048, 0, visible.clamp(max=seed_size)),
             survivors=prefix[:, -1] if rows else visible,
             unbounded=unsafe.sum(-1),
             refinement_tiles=(prefix[:, -1] + 127) // 128 if rows else visible,
+            exact_score_rejected=prefix[:, -1] + visible.clamp(max=2048) - lengths if rows else visible,
+            selection_candidates=lengths,
             seed_tiles=torch.where(visible > 2048, (visible.clamp(max=seed_size) + 127) // 128, 0),
         )
+        if grouped and rows:
+            stats.update(seed_source=seed_source, seed_votes=votes)
     return result

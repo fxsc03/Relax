@@ -12,7 +12,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from torch import nn
 
-from .dosa import dosa_select, frozen_indexer_enabled
+from .dosa import DoSASeedState, dosa_select, frozen_indexer_enabled
 from .indexer import KeyeIndexer, indexer_scores
 from .sparse_attention import compact_indices, sparse_attention
 from .topk import dsa_topk_indices
@@ -129,6 +129,7 @@ class KeyeCoreAttention(nn.Module):
         local_start = 0
         use_dosa = frozen_indexer_enabled(self.config, self.sa_indexer)
         for start, end in zip(boundaries, boundaries[1:]):
+            seed_state = DoSASeedState() if use_dosa else None
             length = (end - start) // size
             q = query[local_start : local_start + length]
             k, v = key[start:end], value[start:end]
@@ -152,12 +153,15 @@ class KeyeCoreAttention(nn.Module):
                         token_offsets[offset:stop] - start,
                         valid[start : start + prefix],
                         heads=getattr(self.config, "keye_dosa_heads", 4),
+                        seed_state=seed_state,
                     )
                 if selected is None:
                     scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
                     scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
                     selected = dsa_topk_indices(scores)
                     selected_valid = causal.gather(1, selected)
+                    if seed_state is not None:
+                        seed_state.publish(selected, token_offsets[offset:stop] - start, prefix, selected_valid)
                     support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
                 else:
                     selected_valid = (selected >= 0) & causal.gather(1, selected.clamp_min(0).long())
