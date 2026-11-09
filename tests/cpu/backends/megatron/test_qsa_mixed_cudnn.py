@@ -77,6 +77,20 @@ def test_dispatch_packed_offsets_and_empty_documents(adapter, monkeypatch):
     assert long == ((2055, 4107),)
 
 
+def test_nv_ignores_flex_configuration(adapter, monkeypatch):
+    monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", "invalid")
+    assert adapter.document_groups((0, 1000, 9000, 29000), 29000) == (((0, 1000),), ((1000, 9000), (9000, 29000)))
+
+
+def test_empty_nv_input_still_validates_configuration(adapter, monkeypatch):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", "2052")
+    q = torch.empty(1, 0, 12, 256, dtype=torch.bfloat16)
+    kv = torch.empty(1, 0, 1, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="dense selector budget"):
+        adapter.attention_for_selection(q, kv, kv, _selection(0), 0.0625, (0, 0))
+
+
 @pytest.mark.parametrize("length", [1, 3, 4, 5, 7, 2047, 2048, 2051, 2052])
 def test_metadata_matches_complete_blocks_and_partial_tail(adapter, length):
     ids = torch.full((length, 512), -1, dtype=torch.int32)

@@ -6,7 +6,7 @@ numerics."""
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -92,7 +92,7 @@ def test_mixed_threshold_keeps_dense_short_and_routes_sparse(monkeypatch, mixed_
     seen = []
 
     def call(kind):
-        def forward(q, *_args):
+        def forward(q, *_args, **_kwargs):
             seen.append(kind)
             return q
 
@@ -127,7 +127,7 @@ def test_explicit_flash_boundary_controls_legacy_long_branch(monkeypatch, mixed_
     seen = []
 
     def route(name):
-        def call(q, *_args):
+        def call(q, *_args, **_kwargs):
             seen.append(name)
             return q
 
@@ -151,3 +151,91 @@ def test_explicit_flash_boundary_rejects_incompatible_settings(monkeypatch, mixe
     ids = torch.empty(2052, 2052, dtype=torch.int32, device="meta")
     with pytest.raises(ValueError, match="dense selector budget|Flex maximum length zero"):
         mixed_dispatcher.attention(q, kv, kv, ids, 256**-0.5)
+
+
+@pytest.mark.parametrize("length,expected", [(35, "flash"), (36, "flex"), (65, "grouped")])
+def test_custom_budget_plan_reaches_single_branch_executor(monkeypatch, mixed_dispatcher, length, expected):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", "64")
+    seen = []
+
+    def auto(q, *args, plan):
+        seen.append("flash" if plan.flash else "flex")
+        return q
+
+    monkeypatch.setattr(mixed_dispatcher, "attention_auto", auto)
+    monkeypatch.setattr(mixed_dispatcher, "long_attention", lambda q, *args: (seen.append("grouped"), q)[1])
+    q, kv = torch.empty(length, 12, 256, device="meta"), torch.empty(length, 1, 256, device="meta")
+    ids = torch.empty(length, 36, dtype=torch.int32, device="meta")
+    assert mixed_dispatcher.attention(q, kv, kv, ids, 0.0625) is q
+    assert seen == [expected]
+
+
+def test_packed_all_branches_preserve_offsets_order_and_qkv_gradients(monkeypatch, mixed_dispatcher):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", "20")
+    bounds = (0, 25, 25, 32, 47, 50, 71, 71, 89)
+    total = bounds[-1]
+    q, k, v = [torch.randn(total, heads, 4, requires_grad=True) for heads in (2, 1, 1)]
+    ids = torch.full((total, 12), -1, dtype=torch.int32)
+    for start, end in zip(bounds, bounds[1:]):
+        ids[start:end, 0] = start
+    ids._qsa_bounds = bounds
+    calls = []
+
+    def flash(q, k, v, cu_q, cu_k, max_q, max_k, **kwargs):
+        assert cu_q.tolist() == cu_k.tolist() == [0, 7, 10]
+        assert max_q == max_k == 7 and kwargs["causal"]
+        calls.append("flash")
+        return q + 2 * k + 3 * v
+
+    def sparse(kind, factor, sizes, origins):
+        def call(q, k, v, selected, scale):
+            calls.append(kind)
+            assert selected._qsa_bounds == sizes
+            offset = 0
+            for length, origin in origins:
+                assert torch.equal(selected[offset : offset + length, 0], torch.full((length,), origin))
+                assert (selected[offset : offset + length, 1:] == -1).all()
+                offset += length
+            if kind == "flex":
+                assert q.shape[0] == 16384
+                assert (selected[offset:] == -1).all()
+                assert selected._qsa_layout[-1] == 16384
+            return factor * (q + 2 * k + 3 * v)
+
+        return call
+
+    monkeypatch.setitem(sys.modules, "flash_attn", SimpleNamespace(flash_attn_varlen_func=flash))
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.models.qwen3_8.ops.qsa_mixed_ops.flex",
+        SimpleNamespace(layout=lambda bounds, device: (None, None, None, max(bounds))),
+    )
+    monkeypatch.setattr(mixed_dispatcher, "flex", sparse("flex", 2, (0, 15, 33, 16384), [(15, 0), (18, 15)]))
+    monkeypatch.setattr(mixed_dispatcher, "long_attention", sparse("grouped", 3, (0, 25, 46), [(25, 0), (21, 25)]))
+    output = mixed_dispatcher.attention(q, k, v, ids, 0.5)
+    factor = torch.tensor([3] * 25 + [1] * 7 + [2] * 15 + [1] * 3 + [3] * 21 + [2] * 18).view(-1, 1, 1)
+    torch.testing.assert_close(output, factor * (q + 2 * k + 3 * v))
+    upstream = torch.randn_like(q)
+    output.backward(upstream)
+    torch.testing.assert_close(q.grad, upstream * factor)
+    torch.testing.assert_close(k.grad, (upstream * factor).sum(dim=1, keepdim=True) * 2)
+    torch.testing.assert_close(v.grad, (upstream * factor).sum(dim=1, keepdim=True) * 3)
+    assert calls == ["flash", "flex", "grouped"]
+
+
+def test_empty_input_keeps_early_return_before_invalid_configuration(monkeypatch, mixed_dispatcher):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", "invalid")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", "invalid")
+    q = torch.empty(0, 12, 256, requires_grad=True)
+    output = mixed_dispatcher.attention(q, q, q, torch.empty(0, 36), 0.0625)
+    assert output is not q
+    output.sum().backward()
+    assert q.grad is not None
+
+
+def test_flash_configuration_is_validated_before_reading_flex(monkeypatch, mixed_dispatcher):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", "36")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", "invalid")
+    q = torch.empty(1, 12, 256, device="meta")
+    with pytest.raises(ValueError, match="dense selector budget"):
+        mixed_dispatcher.attention(q, q, q, torch.empty(1, 36, device="meta"), 0.0625)

@@ -12,6 +12,7 @@ from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention as flex
 from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention_auto
 from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
 from relax.models.qwen3_8.ops.qsa_mixed_ops.grouped import attention_bf16
+from relax.models.qwen3_8.ops.qsa_mixed_ops.policy import flash_max_length, plan_documents
 from relax.utils.env import Envs
 
 
@@ -29,28 +30,18 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
         return q.clone()
     bounds = getattr(indices, "_qsa_bounds", (0, q.shape[0]))
     budget = indices.shape[1] - 4
-    flash_max_len = Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN
-    explicit_flash_boundary = flash_max_len != -1
-    if not explicit_flash_boundary:
-        flash_max_len = budget + 3
-    if not 0 <= flash_max_len <= budget + 3:
-        raise ValueError("Mixed QSA Flash maximum length exceeds the dense selector budget")
+    configured_flash = Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN
+    flash_max_len = flash_max_length(budget, configured_flash)
     flex_max_len = Envs.RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN
     if not 0 <= flex_max_len <= 16384:
         raise ValueError("Mixed QSA Flex maximum length must be in [0, 16384]")
-    if explicit_flash_boundary and flex_max_len:
+    if configured_flash != -1 and flex_max_len:
         raise ValueError("An explicit mixed Flash boundary requires Flex maximum length zero")
-    groups = [[], [], []]
-    for start, end in zip(bounds, bounds[1:]):
-        length = end - start
-        if length == 0:
-            continue
-        kind = 0 if length <= flash_max_len else (1 if length <= flex_max_len else 2)
-        groups[kind].append((start, end))
+    groups = plan_documents(bounds, flash_max_len, flex_max_len)
     if sum(bool(group) for group in groups) <= 1:
-        if groups[2]:
+        if groups.long:
             return long_attention(q, k, v, indices, scale)
-        return attention_auto(q, k, v, indices, scale)
+        return attention_auto(q, k, v, indices, scale, plan=groups)
 
     outputs, order = [], []
     for kind, group in enumerate(groups):

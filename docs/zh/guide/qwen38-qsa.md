@@ -125,6 +125,12 @@ RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped EXP_NAME=qsa-text-grouped \
 
 不同 arm 要使用不同 EXP_NAME 或 SAVE_DIR，避免从对方的 checkpoint 恢复。可以单独设置 NVTE_USE_CUTLASS_GROUPED_GEMM=1 做 MoE 对照，但它既不选择 QSA 实现，也不能证明某个 MoE kernel 实际执行。NV mini-pack 属于实验选项，两套脚本均保持关闭。
 
+## 开发说明
+
+`qsa_mixed_ops/policy.py` 使用 CPU 文档边界和已解析的阈值生成 Flash、Flex、长分支的文档分组；长分支由选定的 Grouped 或 NV adapter 执行。策略不创建 attention tensor、不读取 CUDA 标量、不导入可选 NV 包，也不缓存跨 microbatch 的计划。adapter 保留索引转换、Flex padding、NV 逐文档/mini-pack 调用及输出顺序恢复；单分支快捷路径也消费同一计划。
+
+Grouped 的自动 Flash 上限仍为 token 预算加 3，Flex 阈值与显式 Flash 配置的约束不变。NV 仍要求生产预算、忽略 Flex 配置，并在分流前执行 PR1 的几何检查，包括全短文档输入。空文档、空输入的检查顺序和 checkpoint 的文档边界绑定保持不变；这次组织调整不增加任何后端支持范围或 fallback。
+
 ## Checkpoint 与吞吐口径
 
 脚本把 load/save 配置为稳定的 SAVE_DIR/EXP_NAME 路径，每 SAVE_INTERVAL 步保存一次（默认 50），保留两个 Actor checkpoint。恢复同一实验时保持路径不变，不要追加新时间戳；每次启动的 ClearML task 和日志名称会追加时间戳。脚本通过现有 Megatron 后端配置 checkpoint，dry-run 只检查配置，不代表 optimizer/RNG 状态已成功保存和恢复。

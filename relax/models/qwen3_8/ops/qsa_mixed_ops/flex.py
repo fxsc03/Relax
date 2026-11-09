@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from relax.models.qwen3_8.ops.qsa_mixed_ops.policy import DocumentPlan, plan_documents
+
 
 _compiled_attention = torch.compile(flex_attention, dynamic=True)
 
@@ -46,7 +48,14 @@ def layout(bounds: tuple[int, ...] | list[int], device: torch.device) -> tuple:
     return docs, rows - token_starts, token_starts, max(b - a for a, b in zip(bounds, bounds[1:]))
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float) -> torch.Tensor:
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    plan: DocumentPlan | None = None,
+) -> torch.Tensor:
     assert q.ndim == k.ndim == v.ndim == 3
     tokens = q.shape[0]
     ratio = 4
@@ -54,7 +63,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
     bounds = getattr(indices, "_qsa_bounds", (0, tokens))
     maximum = max(b - a for a, b in zip(bounds, bounds[1:]))
     budget = indices.shape[1] - ratio
-    if maximum <= budget + ratio - 1:
+    if plan is None:
+        plan = plan_documents(bounds, budget + ratio - 1)
+    if not plan.flex and not plan.long:
         from flash_attn import flash_attn_varlen_func
 
         cu = torch.tensor(bounds, device=q.device, dtype=torch.int32)
@@ -108,6 +119,11 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
 
 
 def attention_auto(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    plan: DocumentPlan | None = None,
 ) -> torch.Tensor:
-    return attention(q, k, v, indices, scale)
+    return attention(q, k, v, indices, scale, plan=plan)

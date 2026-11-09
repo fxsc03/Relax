@@ -15,6 +15,7 @@ from torch import Tensor
 from torch.autograd.function import once_differentiable
 
 from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
+from relax.models.qwen3_8.ops.qsa_mixed_ops.policy import flash_max_length, plan_documents
 from relax.utils.env import Envs
 
 
@@ -29,16 +30,9 @@ def document_groups(bounds: tuple[int, ...], total: int) -> tuple[tuple, tuple]:
         or any(left > right for left, right in zip(bounds, bounds[1:]))
     ):
         raise ValueError("Flash/cuDNN mixed attention requires exact producer CPU boundaries")
-    flash_max_len = Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN
-    if flash_max_len == -1:
-        flash_max_len = 2051
-    if not 0 <= flash_max_len <= 2051:
-        raise ValueError("Mixed QSA Flash maximum length exceeds the dense selector budget")
-    short, long = [], []
-    for start, end in zip(bounds, bounds[1:]):
-        if start != end:
-            (short if end - start <= flash_max_len else long).append((start, end))
-    return tuple(short), tuple(long)
+    flash_max_len = flash_max_length(512 * 4, Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN)
+    plan = plan_documents(bounds, flash_max_len)
+    return plan.flash, plan.long
 
 
 def block_metadata(ids: Tensor) -> tuple[Tensor, ...]:

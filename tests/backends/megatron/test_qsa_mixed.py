@@ -248,3 +248,20 @@ def check_qsa_mixed_parallel_geometry(geometry, lengths):
 @pytest.mark.parametrize("lengths", [(2052,), (16385,)])
 def check_qsa_mixed_production_sparse_budget(geometry, lengths):
     _run_case(lengths, 512, geometry)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA branch numerics require CUDA")
+@pytest.mark.parametrize(
+    "geometry,lengths,budget,flex_max",
+    [
+        ((12, 1), (0, 7, 2052, 0, 16385), 512, 16384),
+        ((24, 2), (7, 65, 129), 8, 128),
+        ((3, 1), (7, 65, 129), 8, 128),
+    ],
+)
+def check_qsa_mixed_all_branches(monkeypatch, geometry, lengths, budget, flex_max):
+    # Each pack executes Flash, Flex (including its padding), and Grouped.
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", str(flex_max))
+    monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
+    _run_case(lengths, budget, geometry)

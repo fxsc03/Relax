@@ -125,6 +125,12 @@ RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped EXP_NAME=qsa-text-grouped \
 
 Use distinct EXP_NAME or SAVE_DIR values for separate arms so one does not resume the other's checkpoint. NVTE_USE_CUTLASS_GROUPED_GEMM=1 can be supplied independently for a MoE comparison; it does not select the QSA implementation or prove that a particular MoE kernel ran. The NV mini-pack setting is experimental and remains disabled in these recipes.
 
+## Development notes
+
+`qsa_mixed_ops/policy.py` groups CPU document spans into Flash, Flex, and long branches using resolved limits. The selected Grouped or NV adapter executes the long branch. The policy creates no attention tensors, reads no CUDA scalars, imports no optional NV package, and keeps no plan cache across microbatches. Adapters retain index conversion, Flex padding, NV per-document/mini-pack calls, and output-order restoration; single-branch fast paths consume the same plan.
+
+Grouped's automatic Flash limit remains the token budget plus 3, with the existing Flex limits and explicit-Flash configuration constraints. NV still requires the production budget, ignores Flex configuration, and applies PR1's geometry checks before routing, including all-short inputs. Empty-document handling, empty-input validation order, and checkpoint boundary binding are preserved. This refactor adds no supported geometry or fallback.
+
 ## Checkpoints and throughput
 
 The recipes configure load and save at the stable SAVE_DIR/EXP_NAME path, save every SAVE_INTERVAL steps (default 50), and retain two Actor checkpoints. Keep that path stable to resume; do not append a fresh timestamp. ClearML task names and logs get a timestamp for each launch. The scripts configure checkpointing through the existing Megatron backend; a dry run only checks configuration, not successful optimizer/RNG restoration.

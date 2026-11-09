@@ -21,8 +21,11 @@ SPEC.loader.exec_module(adapter)
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PR1765 numerics require Blackwell CUDA and optional cuDNN QSA"
 )
-@pytest.mark.parametrize("lengths", [(2051,), (2052,), (4097,), (7, 2053, 5, 2052)])
-def test_cuda_output_and_qkv_gradients_against_fp32_reference(monkeypatch, lengths):
+@pytest.mark.parametrize(
+    "lengths,maximum",
+    [((2051,), 0), ((2052,), 0), ((4097,), 0), ((7, 2053, 5, 2052), 0), ((7, 2053, 5, 2052), 8192)],
+)
+def test_cuda_output_and_qkv_gradients_against_fp32_reference(monkeypatch, lengths, maximum):
     """Synthetic numerical regression, not a TP/PP integration or performance
     test."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -31,7 +34,8 @@ def test_cuda_output_and_qkv_gradients_against_fp32_reference(monkeypatch, lengt
         pytest.skip("This integration gate targets Blackwell SM100/SM103")
     pytest.importorskip("cudnn.QSA.api", reason="Install the pinned PR1765 optional dependency")
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
-    monkeypatch.setenv("RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS", "0")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cudnn_pr1765")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS", str(maximum))
     torch.manual_seed(1234)
     total = sum(lengths)
     values = [torch.randn((1, total, h, 256), device="cuda", dtype=torch.bfloat16) / 4 for h in (12, 1, 1)]
